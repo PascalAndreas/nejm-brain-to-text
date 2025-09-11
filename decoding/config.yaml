@@ -1,0 +1,81 @@
+# CTC Decoding Configuration
+# Pure-Python TorchAudio + KenLM pipeline configuration
+
+# Model artifacts paths
+artifacts:
+  tokens_txt: artifacts/tokens.txt
+  lexicon_txt: artifacts/lexicon.txt
+  
+# Language model configuration  
+language_model:
+  # NVIDIA TAO speech-to-text models (recommended)
+  nvidia_tao:
+    model_dir: models/language_models/nvidia_tao_v4.1
+    # Available models in the TAO package:
+    arpa_4gram: models/language_models/nvidia_tao_v4.1/4gram-pruned-0_2_7_9-en-lm-set-1.0.arpa
+    binary_4gram: models/language_models/nvidia_tao_v4.1/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
+    arpa_mixed: models/language_models/nvidia_tao_v4.1/mixed_lm-lower.arpa  # Large 5-gram
+    binary_mixed: models/language_models/nvidia_tao_v4.1/mixed-lower.binary
+    arpa_3gram: models/language_models/nvidia_tao_v4.1/3-gram.pruned.3e-7.arpa
+    vocab_file: models/language_models/nvidia_tao_v4.1/en_4.0_dict_vocab.txt
+    lexicon_file: models/language_models/nvidia_tao_v4.1/lexicon.txt  # Pre-built lexicon
+  
+  # Currently active model (change this to switch models)
+  active_model: models/language_models/nvidia_tao_v4.1/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
+
+# CTC Decoder parameters (based on legacy system research)
+decoder:
+  # Core parameters (proven values from legacy system)
+  lm_weight: 0.35      # acoustic_scale from legacy (0.325-0.35 working)
+  word_score: -90.0    # negative blank_penalty from legacy (90.0 working)  
+  beam_size: 17        # beam from legacy (17.0 default)
+  beam_size_token: 10  # token-level beam size
+  beam_threshold: 8.0  # lattice_beam from legacy
+  nbest: 100          # number of n-best hypotheses
+  
+  # Token definitions (matching evaluate_model_helpers.py)
+  blank_token: "BLANK"
+  silence_token: "SIL" 
+  unk_word: "<unk>"
+
+# Lexicon building configuration
+lexicon:
+  # CMUdict settings
+  cmudict_url: "https://raw.githubusercontent.com/cmusphinx/cmudict/master/cmudict.dict"
+  cmudict_cache: artifacts/cmudict.dict
+  
+  # Vocabulary settings
+  lm_vocab_size: 50000           # Number of top words to extract from LM
+  
+  # Phone mapping (ARPAbet to 39-phone set)
+  strip_stress: true             # Remove stress digits (AH0 -> AH)
+  map_allophones: true           # Map allophones (AX -> AH, IX -> IH, etc.)
+
+# Text normalization for submission
+submission:
+  lowercase: true       # Convert to lowercase
+  strip_punct: true     # Remove punctuation  
+  collapse_space: true  # Collapse multiple spaces to single space
+
+# Hyperparameter tuning grid
+tuning:
+  # Parameter ranges for grid search
+  lm_weights: [0.1, 0.2, 0.35, 0.5, 1.0, 2.0, 3.0, 4.0]
+  word_scores: [-100.0, -90.0, -50.0, -10.0, -1.0, -0.5, 0.0, 0.5, 1.0]
+  beam_sizes: [10, 17, 50]  # Optional: test different beam sizes
+  
+  # Evaluation settings
+  primary_metric: "WER"  # Primary optimization metric
+  save_nbest: true       # Save n-best hypotheses for analysis
+
+# Logging and output
+logging:
+  level: INFO
+  save_logs: true
+  log_dir: logs/decoding
+
+# W&B integration for tuning
+wandb:
+  project: "nejm-brain-to-text-decoding"
+  entity: null  # Set to your W&B username
+  tags: ["ctc", "decoding", "tuning"]

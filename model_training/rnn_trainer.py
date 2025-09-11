@@ -12,6 +12,14 @@ import sys
 import json
 import pickle
 
+# W&B for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available, skipping experiment logging")
+
 from dataset import BrainToTextDataset, train_test_split_indicies
 from data_augmentations import gauss_smooth
 
@@ -108,7 +116,23 @@ class BrainToTextDecoder_Trainer:
 
         self.logger.info(f'Using device: {self.device}')
 
-
+        # Initialize W&B if available and in training mode
+        self.wandb_run = None
+        if WANDB_AVAILABLE and args['mode'] == 'train' and args.get('wandb', {}).get('project'):
+            try:
+                wandb_config = args.get('wandb', {})
+                self.wandb_run = wandb.init(
+                    project=wandb_config.get('project', 'nejm-brain-to-text'),
+                    entity=wandb_config.get('entity'),
+                    name=wandb_config.get('name'),
+                    tags=wandb_config.get('tags', []),
+                    config=dict(args),  # Log all hyperparameters
+                    save_code=True
+                )
+                self.logger.info(f"Initialized W&B run: {self.wandb_run.name}")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize W&B: {e}")
+                self.wandb_run = None
 
         # Set seed if provided 
         if self.args['seed'] != -1:
@@ -567,6 +591,17 @@ class BrainToTextDecoder_Trainer:
                         f'loss: {(loss.detach().item()):.2f} ' +
                         f'grad norm: {grad_norm:.2f} '
                         f'time: {train_step_duration:.3f}')
+                
+                # Log to W&B
+                if self.wandb_run:
+                    log_dict = {
+                        'train/loss': loss.detach().item(),
+                        'train/grad_norm': grad_norm,
+                        'train/lr': self.learning_rate_scheduler.get_last_lr()[0],
+                        'train/step_time': train_step_duration,
+                        'train/batch': i
+                    }
+                    self.wandb_run.log(log_dict, step=i)
 
             # Incrementally run a test step
             if i % self.args['batches_per_val_step'] == 0 or i == ((self.args['num_training_batches'] - 1)):
@@ -587,6 +622,26 @@ class BrainToTextDecoder_Trainer:
                 if self.args['log_individual_day_val_PER']:
                     for day in val_metrics['day_PERs'].keys():
                         self.logger.info(f"{self.args['dataset']['sessions'][day]} val PER: {val_metrics['day_PERs'][day]['total_edit_distance'] / val_metrics['day_PERs'][day]['total_seq_length']:0.4f}")
+
+                # Log validation metrics to W&B
+                if self.wandb_run:
+                    val_log_dict = {
+                        'val/PER': val_metrics["avg_PER"],
+                        'val/loss': val_metrics["avg_loss"],
+                        'val/step_time': val_step_duration,
+                        'val/best_PER': self.best_val_PER,
+                        'val/best_loss': self.best_val_loss
+                    }
+                    
+                    # Log individual day PERs if available
+                    if 'day_PERs' in val_metrics:
+                        for day, day_metrics in val_metrics['day_PERs'].items():
+                            if day_metrics['total_seq_length'] > 0:
+                                day_per = day_metrics['total_edit_distance'] / day_metrics['total_seq_length']
+                                session_name = self.args['dataset']['sessions'][day]
+                                val_log_dict[f'val/PER_{session_name}'] = day_per
+                    
+                    self.wandb_run.log(val_log_dict, step=i)
 
                 # Save metrics 
                 val_PERs.append(val_metrics['avg_PER'])
@@ -641,6 +696,17 @@ class BrainToTextDecoder_Trainer:
         # Save final model 
         if self.args['save_final_model']:
             self.save_model_checkpoint(f'{self.args["checkpoint_dir"]}/final_checkpoint_batch_{i}', val_PERs[-1])
+
+        # Log final metrics to W&B
+        if self.wandb_run:
+            final_log_dict = {
+                'final/best_val_PER': self.best_val_PER,
+                'final/best_val_loss': self.best_val_loss,
+                'final/training_time_minutes': training_duration / 60,
+                'final/total_batches': i + 1
+            }
+            self.wandb_run.log(final_log_dict)
+            self.wandb_run.finish()
 
         train_stats = {}
         train_stats['train_losses'] = train_losses

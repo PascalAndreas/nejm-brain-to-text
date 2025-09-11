@@ -4,17 +4,8 @@ from g2p_en import G2p
 
 
 
-LOGIT_PHONE_DEF = [
-    'BLANK', 'SIL', # blank and silence
-    'AA', 'AE', 'AH', 'AO', 'AW',
-    'AY', 'B',  'CH', 'D', 'DH',
-    'EH', 'ER', 'EY', 'F', 'G',
-    'HH', 'IH', 'IY', 'JH', 'K',
-    'L', 'M', 'N', 'NG', 'OW',
-    'OY', 'P', 'R', 'S', 'SH',
-    'T', 'TH', 'UH', 'UW', 'V',
-    'W', 'Y', 'Z', 'ZH'
-]
+# LOGIT_PHONE_DEF removed - it was incorrect and conflicted with the actual model mapping.
+# Use LOGIT_TO_PHONEME from model_training/evaluate_model_helpers.py instead.
 SIL_DEF = ['SIL']
 
 

@@ -16,7 +16,7 @@ LOGIT_TO_PHONEME = [
     'OY', 'P', 'R', 'S', 'SH',
     'T', 'TH', 'UH', 'UW', 'V',
     'W', 'Y', 'Z', 'ZH',
-    ' | ',
+    'SIL',
 ]
 
 def _extract_transcription(input):
