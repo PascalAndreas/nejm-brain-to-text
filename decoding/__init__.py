@@ -14,7 +14,7 @@ _config_path = Path(__file__).parent / "config.yaml"
 DEFAULT_CONFIG = OmegaConf.load(_config_path)
 
 from .build_tokens import build_tokens
-from .build_lexicon import build_lexicon, extract_lm_vocabulary
+from .build_lexicon import build_lexicon, extract_lm_vocabulary_from_lexicon
 from .filter_lm import filter_language_model
 from .decode_ctc import CTCDecoder
 
@@ -25,7 +25,7 @@ __all__ = [
     'DEFAULT_CONFIG',
     'build_tokens',
     'build_lexicon',
-    'extract_lm_vocabulary', 
+    'extract_lm_vocabulary_from_lexicon', 
     'filter_language_model',
     'CTCDecoder'
 ]

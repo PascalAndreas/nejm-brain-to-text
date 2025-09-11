@@ -25,12 +25,12 @@ language_model:
 
 # CTC Decoder parameters (based on legacy system research)
 decoder:
-  # Core parameters (proven values from legacy system)
-  lm_weight: 0.35      # acoustic_scale from legacy (0.325-0.35 working)
-  word_score: -90.0    # negative blank_penalty from legacy (90.0 working)  
-  beam_size: 17        # beam from legacy (17.0 default)
-  beam_size_token: 10  # token-level beam size
-  beam_threshold: 8.0  # lattice_beam from legacy
+  # Core parameters (aggressive settings for debugging)
+  lm_weight: 0.0       # Language model weight (disabled for testing)
+  word_score: 0.0      # Word insertion bonus/penalty (neutral)
+  beam_size: 100       # Number of beams in search (much larger)
+  beam_size_token: 50  # Token-level beam size (much larger)
+  beam_threshold: 10.0 # Pruning threshold (much more permissive)
   nbest: 100          # number of n-best hypotheses
   
   # Token definitions (matching evaluate_model_helpers.py)
@@ -42,10 +42,10 @@ decoder:
 lexicon:
   # CMUdict settings
   cmudict_url: "https://raw.githubusercontent.com/cmusphinx/cmudict/master/cmudict.dict"
-  cmudict_cache: artifacts/cmudict.dict
+  cmudict_cache: decoding/artifacts/cmudict.dict
   
   # Vocabulary settings
-  lm_vocab_size: 50000           # Number of top words to extract from LM
+  lm_vocab_size: 60000           # Number of top words to extract from LM
   
   # Phone mapping (ARPAbet to 39-phone set)
   strip_stress: true             # Remove stress digits (AH0 -> AH)

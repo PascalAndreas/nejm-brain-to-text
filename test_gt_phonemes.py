@@ -24,6 +24,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from decoding.decode_ctc import CTCDecoder
 from decoding import DEFAULT_CONFIG
 from model_training.evaluate_model_helpers import LOGIT_TO_PHONEME
+from nejm_b2txt_utils.general_utils import remove_punctuation
 
 
 def generate_logits(
@@ -32,7 +33,8 @@ def generate_logits(
     perfection: float = 0.95,
     time_expansion: float = 2.0,
     noise_level: float = 0.1,
-    blank_probability: float = 0.3
+    blank_probability: float = 0.3,
+    perfect_one_hot: bool = False
 ) -> torch.Tensor:
     """
     Generate realistic CTC logits with controllable perfection.
@@ -44,10 +46,23 @@ def generate_logits(
         time_expansion: How much longer the time sequence should be vs phonemes
         noise_level: Amount of random noise to add
         blank_probability: Probability of inserting blanks between phonemes
+        perfect_one_hot: If True, return perfect one-hot logits with no noise
     
     Returns:
         Logits tensor [1, time, vocab] with realistic CTC patterns
     """
+    # Handle perfect one-hot case
+    if perfect_one_hot:
+        # Create perfect one-hot logits directly from ground truth
+        num_time_steps = len(gt_phoneme_indices)
+        logits = np.full((num_time_steps, num_phonemes), -np.inf, dtype=np.float32)
+        
+        for t, ph_idx in enumerate(gt_phoneme_indices):
+            if ph_idx < num_phonemes:
+                logits[t, ph_idx] = 0.0  # One-hot: 1.0 probability for correct phoneme
+        
+        return torch.from_numpy(logits).unsqueeze(0)  # Add batch dimension
+    
     # Calculate realistic time steps based on phoneme sequence and expansion
     base_time_steps = len(gt_phoneme_indices)
     num_time_steps = int(base_time_steps * time_expansion)
@@ -137,7 +152,9 @@ def extract_ground_truth_text(transcription, sentence_label):
         # It's an array of character codes
         sentence_label = ''.join([chr(int(code)) for code in sentence_label if int(code) != 0])
     
-    return sentence_label.strip().lower()
+    # Remove punctuation and normalize
+    text = remove_punctuation(sentence_label.strip())
+    return text
 
 
 def test_ctc_pipeline_with_ground_truth(
@@ -145,36 +162,53 @@ def test_ctc_pipeline_with_ground_truth(
     perfection: float = 0.95,
     time_expansion: float = 2.0,
     noise_level: float = 0.1,
-    blank_probability: float = 0.3
+    blank_probability: float = 0.3,
+    lm_weight: float = None,
+    word_score: float = None,
+    beam_size: int = None,
+    perfect_one_hot: bool = False,
+    verbose: bool = True
 ):
     """Test the CTC decoding pipeline using ground truth phoneme sequences."""
-    print("🧪 Testing CTC Pipeline with Ground Truth Phonemes")
-    print("=" * 60)
-    print(f"🎯 Parameters:")
-    print(f"   Samples: {num_samples}")
-    print(f"   Perfection: {perfection:.2f}")
-    print(f"   Time expansion: {time_expansion:.1f}x")
-    print(f"   Noise level: {noise_level:.2f}")
-    print(f"   Blank probability: {blank_probability:.2f}")
+    if verbose:
+        print("🧪 Testing CTC Pipeline with Ground Truth Phonemes")
+        print("=" * 60)
+        print(f"🎯 Parameters:")
+        print(f"   Samples: {num_samples}")
+        print(f"   Perfection: {perfection:.2f}")
+        print(f"   Time expansion: {time_expansion:.1f}x")
+        print(f"   Noise level: {noise_level:.2f}")
+        print(f"   Blank probability: {blank_probability:.2f}")
+        print(f"   Perfect one-hot: {perfect_one_hot}")
+        if lm_weight is not None or word_score is not None or beam_size is not None:
+            print(f"   Custom decoder params: lm_weight={lm_weight}, word_score={word_score}, beam_size={beam_size}")
     
     # Load configuration
     config = DEFAULT_CONFIG
-    print(f"\n📁 Using config from: {config}")
+    if verbose:
+        print(f"\n📁 Using config from: {config}")
     
-    # Initialize decoder
-    print("\n🔧 Initializing CTC decoder...")
-    decoder = CTCDecoder()  # Will use config defaults
+    # Initialize decoder with custom parameters if provided
+    if verbose:
+        print("\n🔧 Initializing CTC decoder...")
+    decoder = CTCDecoder(
+        lm_weight=lm_weight,
+        word_score=word_score,
+        beam_size=beam_size
+    )
     
-    print(f"✅ Decoder initialized:")
-    print(f"   Tokens: {len(decoder.tokens)}")
-    print(f"   Blank idx: {decoder.blank_idx}")
-    print(f"   Silence idx: {decoder.silence_idx}")
+    if verbose:
+        print(f"✅ Decoder initialized:")
+        print(f"   Tokens: {len(decoder.tokens)}")
+        print(f"   Blank idx: {decoder.blank_idx}")
+        print(f"   Silence idx: {decoder.silence_idx}")
     
     # Load samples from the dataset
     data_dir = Path("data/t15_copyTask_neuralData/hdf5_data_final")
     sessions = ["t15.2023.08.11", "t15.2023.08.13"]
     
-    print(f"\n📊 Loading test data from: {data_dir}")
+    if verbose:
+        print(f"\n📊 Loading test data from: {data_dir}")
     
     sample_data = []
     total_samples = 0
@@ -182,10 +216,12 @@ def test_ctc_pipeline_with_ground_truth(
     for session in sessions:
         session_path = data_dir / session / "data_train.hdf5"
         if not session_path.exists():
-            print(f"⚠️ Session file not found: {session_path}")
+            if verbose:
+                print(f"⚠️ Session file not found: {session_path}")
             continue
             
-        print(f"📂 Loading from: {session}")
+        if verbose:
+            print(f"📂 Loading from: {session}")
         
         with h5py.File(session_path, 'r') as f:
             # Get trials from this session
@@ -210,15 +246,18 @@ def test_ctc_pipeline_with_ground_truth(
         if total_samples >= num_samples:
             break
     
-    print(f"📈 Loaded {len(sample_data)} samples for testing")
+    if verbose:
+        print(f"📈 Loaded {len(sample_data)} samples for testing")
     
     # Test each sample
-    print(f"\n🔍 Testing samples...")
+    if verbose:
+        print(f"\n🔍 Testing samples...")
     
     results = []
     for i, sample in enumerate(sample_data):
-        print(f"\n--- Sample {i+1}/{len(sample_data)} ---")
-        print(f"Session: {sample['session']}, Trial: {sample['trial']}")
+        if verbose:
+            print(f"\n--- Sample {i+1}/{len(sample_data)} ---")
+            print(f"Session: {sample['session']}, Trial: {sample['trial']}")
         
         # Extract ground truth and remove padding (assuming 0 is padding)
         gt_phoneme_indices = sample['seq_class_ids']
@@ -227,8 +266,9 @@ def test_ctc_pipeline_with_ground_truth(
         gt_phonemes = [LOGIT_TO_PHONEME[idx] for idx in gt_phoneme_indices if idx < len(LOGIT_TO_PHONEME)]
         gt_text = extract_ground_truth_text(sample['transcription'], sample['sentence_label'])
         
-        print(f"GT phonemes ({len(gt_phonemes)} total): {' '.join(gt_phonemes[:20])}{'...' if len(gt_phonemes) > 20 else ''}")
-        print(f"GT text: '{gt_text}'")
+        if verbose:
+            print(f"GT phonemes ({len(gt_phonemes)} total): {' '.join(gt_phonemes[:20])}{'...' if len(gt_phonemes) > 20 else ''}")
+            print(f"GT text: '{gt_text}'")
         
         # Generate logits with specified perfection
         dummy_logits = generate_logits(
@@ -237,19 +277,17 @@ def test_ctc_pipeline_with_ground_truth(
             perfection=perfection,
             time_expansion=time_expansion,
             noise_level=noise_level,
-            blank_probability=blank_probability
+            blank_probability=blank_probability,
+            perfect_one_hot=perfect_one_hot
         )
         
-        print(f"Logits shape: {dummy_logits.shape}")
-        print(f"Expected time expansion: {len(gt_phoneme_indices)} phonemes * {time_expansion} = ~{int(len(gt_phoneme_indices) * time_expansion)} time steps")
-        
-        # Print some sample logits values
-        print(f"Sample logits (first 5 time steps, first 10 phonemes):")
-        logits_sample = dummy_logits[0, :5, :10].numpy()
-        for t in range(min(5, dummy_logits.shape[1])):
-            values_str = ' '.join([f"{val:6.2f}" for val in logits_sample[t]])
-            print(f"  t={t:2d}: [{values_str}]")
-        print(f"  Max logit in sequence: {dummy_logits.max().item():.2f}, Min: {dummy_logits.min().item():.2f}")
+        if verbose:
+            print(f"Logits shape: {dummy_logits.shape}")
+            
+            # Print argmax phonemes from generated logits
+            argmax_indices = torch.argmax(dummy_logits[0], dim=-1)
+            argmax_phonemes = [LOGIT_TO_PHONEME[idx.item()] for idx in argmax_indices if idx.item() < len(LOGIT_TO_PHONEME)]
+            print(f"Generated phonemes ({len(argmax_phonemes)} total): {' '.join(argmax_phonemes[:20])}{'...' if len(argmax_phonemes) > 20 else ''}")
         
         # Decode
         try:
@@ -258,16 +296,32 @@ def test_ctc_pipeline_with_ground_truth(
                 result = decoded_results[0] if isinstance(decoded_results, list) else decoded_results
                 predicted_text = result.get('sentence', result.get('text', 'N/A'))
                 predicted_tokens = result.get('tokens', [])
-                
-                print(f"Predicted: '{predicted_text}'")
-                print(f"Tokens: {' '.join(predicted_tokens[:10])}{'...' if len(predicted_tokens) > 10 else ''}")
+
+                if verbose:
+                    print(f"Predicted: '{predicted_text}'")
+                    print(f"Tokens: {' '.join(predicted_tokens[:20])}{'...' if len(predicted_tokens) > 20 else ''}")
+
+                    # Print nbest alternatives if available
+                    if isinstance(decoded_results, list) and len(decoded_results) > 1:
+                        print(f"N-best alternatives:")
+                        for i, alt_result in enumerate(decoded_results[1:min(4, len(decoded_results))], 1):
+                            alt_text = alt_result.get('sentence', alt_result.get('text', 'N/A'))
+                            alt_score = alt_result.get('score', 'N/A')
+                            print(f"  {i}. '{alt_text}' (score: {alt_score})")
+                        if len(decoded_results) > 4:
+                            print(f"  ... and {len(decoded_results) - 4} more")
+                    elif isinstance(decoded_results, list) and len(decoded_results) == 1:
+                        print("N-best: Only one result available")
+                    else:
+                        print("N-best: Not a list or single result")
                 
                 # Calculate metrics if we have ground truth text
                 if gt_text and predicted_text != 'N/A':
                     try:
                         char_error_rate = cer(gt_text, predicted_text)
                         word_error_rate = wer(gt_text, predicted_text)
-                        print(f"CER: {char_error_rate:.3f}, WER: {word_error_rate:.3f}")
+                        if verbose:
+                            print(f"CER: {char_error_rate:.3f}, WER: {word_error_rate:.3f}")
                         
                         results.append({
                             'sample': i + 1,
@@ -279,7 +333,8 @@ def test_ctc_pipeline_with_ground_truth(
                             'wer': word_error_rate
                         })
                     except Exception as e:
-                        print(f"⚠️ Error calculating metrics: {e}")
+                        if verbose:
+                            print(f"⚠️ Error calculating metrics: {e}")
                         results.append({
                             'sample': i + 1,
                             'gt_text': gt_text,
@@ -290,7 +345,8 @@ def test_ctc_pipeline_with_ground_truth(
                             'wer': float('inf')
                         })
                 else:
-                    print("⚠️ No ground truth text available for metrics")
+                    if verbose:
+                        print("⚠️ No ground truth text available for metrics")
                     results.append({
                         'sample': i + 1,
                         'gt_text': gt_text,
@@ -301,7 +357,8 @@ def test_ctc_pipeline_with_ground_truth(
                         'wer': float('inf')
                     })
             else:
-                print("❌ No decoding results")
+                if verbose:
+                    print("❌ No decoding results")
                 results.append({
                     'sample': i + 1,
                     'gt_text': gt_text,
@@ -312,7 +369,8 @@ def test_ctc_pipeline_with_ground_truth(
                     'wer': float('inf')
                 })
         except Exception as e:
-            print(f"❌ Decoding failed: {e}")
+            if verbose:
+                print(f"❌ Decoding failed: {e}")
             results.append({
                 'sample': i + 1,
                 'gt_text': gt_text,
@@ -324,25 +382,30 @@ def test_ctc_pipeline_with_ground_truth(
             })
     
     # Summary
-    print(f"\n📊 SUMMARY")
-    print("=" * 60)
-    
-    valid_results = [r for r in results if r['cer'] != float('inf')]
+    valid_results = [r for r in results if r['wer'] != float('inf')]
     if valid_results:
         avg_cer = np.mean([r['cer'] for r in valid_results])
         avg_wer = np.mean([r['wer'] for r in valid_results])
-        print(f"Average CER: {avg_cer:.3f}")
-        print(f"Average WER: {avg_wer:.3f}")
-        print(f"Valid samples: {len(valid_results)}/{len(results)}")
         
-        if avg_wer < 0.1:  # Less than 10% error
-            print("🎉 SUCCESS: Pipeline working correctly with ground truth phonemes!")
-        else:
-            print("⚠️ WARNING: Higher than expected error rate")
+        if verbose:
+            print(f"\n📊 SUMMARY")
+            print("=" * 60)
+            print(f"Average CER: {avg_cer:.3f}")
+            print(f"Average WER: {avg_wer:.3f}")
+            print(f"Valid samples: {len(valid_results)}/{len(results)}")
+            
+            if avg_wer < 0.1:  # Less than 10% error
+                print("🎉 SUCCESS: Pipeline working correctly with ground truth phonemes!")
+            else:
+                print("⚠️ WARNING: Higher than expected error rate")
+        
+        return avg_wer  # Return average WER for grid search
     else:
-        print("❌ FAILED: No valid results obtained")
-    
-    return results
+        if verbose:
+            print(f"\n📊 SUMMARY")
+            print("=" * 60)
+            print("❌ FAILED: No valid results obtained")
+        return float('inf')  # Return infinity for failed cases
 
 
 def parse_args():
@@ -355,7 +418,7 @@ def parse_args():
     parser.add_argument(
         '--num_samples', 
         type=int, 
-        default=6,
+        default=20,
         help='Number of samples to test'
     )
     
@@ -394,6 +457,12 @@ def parse_args():
         help='Random seed for reproducibility'
     )
     
+    parser.add_argument(
+        '--perfect_one_hot',
+        action='store_true',
+        help='Generate perfect one-hot logits with no noise'
+    )
+    
     return parser.parse_args()
 
 
@@ -409,5 +478,6 @@ if __name__ == "__main__":
         perfection=args.perfection,
         time_expansion=args.time_expansion,
         noise_level=args.noise_level,
-        blank_probability=args.blank_probability
+        blank_probability=args.blank_probability,
+        perfect_one_hot=args.perfect_one_hot
     )

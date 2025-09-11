@@ -6,10 +6,15 @@ Maps words to phone sequences for lexicon-constrained CTC decoding.
 import os
 import re
 import sys
+import warnings
 from pathlib import Path
 from typing import Set, Dict, List, Tuple
 from collections import defaultdict
 import urllib.request
+
+# Suppress G2P numpy warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="g2p_en")
+
 from g2p_en import G2p
 
 # Add parent directory to path to import nejm_b2txt_utils
@@ -130,35 +135,38 @@ def map_phones_to_logit_set(phones: List[str]) -> List[str]:
     return mapped_phones
 
 
-def extract_lm_vocabulary(vocab_file_path: str, top_n: int = 50000) -> Set[str]:
+def extract_lm_vocabulary_from_lexicon(lexicon_file_path: str, top_n: int = 50000) -> List[str]:
     """
-    Extract top-N vocabulary from language model vocabulary file.
+    Extract top-N vocabulary from NVIDIA TAO lexicon file (already frequency-ordered).
     
     Args:
-        vocab_file_path: Path to vocabulary file (e.g., NVIDIA TAO en_4.0_dict_vocab.txt)
+        lexicon_file_path: Path to NVIDIA TAO lexicon.txt file  
         top_n: Number of top words to extract
         
     Returns:
-        Set of vocabulary words
+        List of vocabulary words in frequency order
     """
-    vocab = set()
+    vocab = []
     
-    if not os.path.exists(vocab_file_path):
-        print(f"Warning: Vocabulary file not found: {vocab_file_path}")
+    if not os.path.exists(lexicon_file_path):
+        print(f"Warning: Lexicon file not found: {lexicon_file_path}")
         return vocab
     
-    print(f"Loading vocabulary from: {vocab_file_path}")
+    print(f"Loading vocabulary from TAO lexicon: {lexicon_file_path}")
     
-    with open(vocab_file_path, 'r', encoding='utf-8') as f:
+    with open(lexicon_file_path, 'r', encoding='utf-8') as f:
         for i, line in enumerate(f):
-            if i >= top_n:
+            if len(vocab) >= top_n:
                 break
                 
-            word = line.strip().split()[0] if line.strip() else ""
-            if word and word.replace("'", "").replace("-", "").isalpha():
-                vocab.add(word.upper())
+            parts = line.strip().split('\t')
+            if len(parts) >= 1:
+                word = parts[0].strip()
+                # Only include alphabetic words (no punctuation, numbers, etc.)
+                if word and word.replace("'", "").replace("-", "").isalpha():
+                    vocab.append(word.upper())
     
-    print(f"Extracted {len(vocab)} words from LM vocabulary")
+    print(f"Extracted {len(vocab)} words from TAO lexicon")
     return vocab
 
 
@@ -187,13 +195,14 @@ def build_lexicon(
         cmudict_path = download_cmudict()
     cmudict = load_cmudict(cmudict_path)
     
-    # Get vocabulary from language model
-    if lm_vocab_file and os.path.exists(lm_vocab_file):
-        vocab = extract_lm_vocabulary(lm_vocab_file, vocab_boost_size)
-        print(f"Using LM vocabulary: {len(vocab)} words")
+    # Get vocabulary from NVIDIA TAO lexicon (frequency-ordered)
+    tao_lexicon_file = lm_vocab_file.replace('en_4.0_dict_vocab.txt', 'lexicon.txt') if lm_vocab_file else None
+    if tao_lexicon_file and os.path.exists(tao_lexicon_file):
+        vocab_list = extract_lm_vocabulary_from_lexicon(tao_lexicon_file, vocab_boost_size)
+        print(f"Using TAO lexicon vocabulary: {len(vocab_list)} words")
     else:
-        print("No LM vocabulary file provided, using CMUdict only")
-        vocab = set()
+        print("No TAO lexicon file found, using CMUdict only")
+        vocab_list = []
     
     # Initialize G2P for OOV words
     g2p = G2p()
@@ -202,13 +211,17 @@ def build_lexicon(
     lexicon = {}
     oov_count = 0
     total_words = 0
+    words_added = 0
     
-    # Process all words in vocabulary
-    all_words = set(cmudict.keys()) | vocab
+    print(f"Building lexicon with up to {vocab_boost_size} words...")
     
-    for word in all_words:
+    # Process TAO vocabulary words first (already in frequency order)
+    for word in vocab_list:
+        if words_added >= vocab_boost_size:
+            break
+            
         word_clean = word.upper().strip()
-        if not word_clean or not word_clean.replace("'", "").isalpha():
+        if not word_clean or not word_clean.replace("'", "").replace("-", "").isalpha():
             continue
             
         total_words += 1
@@ -237,14 +250,21 @@ def build_lexicon(
         
         if pronunciations:
             lexicon[word_clean] = pronunciations
+            words_added += 1
     
-    # Write lexicon file
+    print(f"Successfully added {words_added} words to lexicon")
+    
+    # Write lexicon file - words in frequency order from TAO lexicon
     total_pronunciations = 0
     with open(output_path, 'w') as f:
-        for word, pronunciations in sorted(lexicon.items()):
-            for pron in pronunciations:
-                f.write(f"{word.lower()} {' '.join(pron)}\n")
-                total_pronunciations += 1
+        # Write words in frequency order from TAO lexicon
+        for word in vocab_list:
+            word_clean = word.upper().strip()
+            if word_clean in lexicon:
+                pronunciations = lexicon[word_clean]
+                for pron in pronunciations:
+                    f.write(f"{word_clean.lower()} {' '.join(pron)}\n")
+                    total_pronunciations += 1
     
     # Calculate statistics
     oov_rate = oov_count / total_words if total_words > 0 else 0
@@ -263,7 +283,7 @@ def build_lexicon(
                 phones = parts[1:]
                 all_phones_in_lexicon.update(phones)
     
-    invalid_phones = all_phones_in_lexicon - set(LOGIT_TO_PHONEME[1:40])  # Exclude BLANK (0) and ' | ' (40)
+    invalid_phones = all_phones_in_lexicon - set(LOGIT_TO_PHONEME[1:40])  # Exclude BLANK (0) and 'SIL' (40)
     if invalid_phones:
         print(f"WARNING: Invalid phones in lexicon: {invalid_phones}")
     else:
@@ -273,6 +293,25 @@ def build_lexicon(
 
 
 if __name__ == "__main__":
-    # Build lexicon with default settings
-    output_path = "artifacts/lexicon.txt"
-    build_lexicon(output_path)
+    import yaml
+    
+    # Load configuration
+    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        vocab_size = config.get('lexicon', {}).get('lm_vocab_size', 50000)
+        lm_vocab_file = config.get('language_model', {}).get('nvidia_tao', {}).get('lexicon_file')
+        output_path = config.get('artifacts', {}).get('lexicon_txt')
+    else:
+        vocab_size = 50000
+        lm_vocab_file = None
+        output_path = 'artifacts/lexicon.txt'
+    
+    # Build lexicon with configuration settings
+    build_lexicon(
+        output_path, 
+        vocab_boost_size=vocab_size,
+        lm_vocab_file=lm_vocab_file
+    )

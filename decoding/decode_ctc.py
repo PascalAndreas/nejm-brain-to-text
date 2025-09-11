@@ -148,9 +148,10 @@ class CTCDecoder:
                     tokens.append(token)
         return tokens
     
-    def _load_lexicon_dict(self) -> Dict[str, str]:
+    def _load_lexicon_dict(self) -> Dict[str, List[str]]:
         """Load lexicon and create phoneme-to-word mapping for greedy fallback."""
-        lexicon_dict = {}
+        from collections import defaultdict
+        lexicon_dict = defaultdict(list)
         try:
             with open(self.lexicon_path, 'r') as f:
                 for line in f:
@@ -158,17 +159,32 @@ class CTCDecoder:
                     if len(parts) >= 2:
                         word = parts[0]
                         phonemes = ' '.join(parts[1:])
-                        # Map phoneme sequence to word
-                        lexicon_dict[phonemes] = word
-            print(f"Loaded {len(lexicon_dict)} lexicon entries for greedy fallback")
+                        # Collect all possible words for this phoneme sequence
+                        lexicon_dict[phonemes].append(word)
+            
+            # Convert to regular dict with lists
+            lexicon_dict = dict(lexicon_dict)
+            total_entries = sum(len(words) for words in lexicon_dict.values())
+            print(f"Loaded {len(lexicon_dict)} unique pronunciations with {total_entries} word entries for greedy fallback")
         except Exception as e:
             print(f"Warning: Could not load lexicon for greedy fallback: {e}")
+            lexicon_dict = {}
         return lexicon_dict
+    
+    def _select_best_word(self, word_candidates: List[str]) -> str:
+        """
+        Select the best word from candidates for a phoneme sequence.
+        Since lexicon is pre-filtered by build_lexicon.py, just take the first one.
+        """
+        if not word_candidates:
+            return ""
+        # Since build_lexicon.py already handles word selection/filtering, just take first
+        return word_candidates[0]
     
     def _phonemes_to_words(self, phoneme_tokens: List[str]) -> List[str]:
         """
         Convert phoneme sequence to words using lexicon lookup.
-        Uses greedy longest-match algorithm.
+        Uses greedy longest-match algorithm with improved word selection.
         """
         if not phoneme_tokens:
             return []
@@ -183,19 +199,21 @@ class CTCDecoder:
                 continue
             
             # Try to find longest matching phoneme sequence
-            best_match = None
+            best_candidates = None
             best_length = 0
             
-            # Try sequences of decreasing length
-            for length in range(min(10, len(phoneme_tokens) - i), 0, -1):
+            # Try sequences of decreasing length (no arbitrary cap)
+            for length in range(len(phoneme_tokens) - i, 0, -1):
                 phoneme_seq = ' '.join(phoneme_tokens[i:i+length])
                 if phoneme_seq in self.lexicon_dict:
-                    best_match = self.lexicon_dict[phoneme_seq]
+                    best_candidates = self.lexicon_dict[phoneme_seq]
                     best_length = length
                     break
             
-            if best_match:
-                words.append(best_match)
+            if best_candidates:
+                # Select best word from candidates
+                best_word = self._select_best_word(best_candidates)
+                words.append(best_word)
                 i += best_length
             else:
                 # No match found, keep as phoneme or skip
@@ -205,15 +223,12 @@ class CTCDecoder:
         
         return words
     
+    
     def _build_decoder(self):
         """Build Flashlight CTC decoder."""
         if not FLASHLIGHT_AVAILABLE:
             print("Flashlight not available, using greedy decoder")
             return None
-        
-        # Skip flashlight for now due to trie size issues with large lexicon
-        print("Skipping Flashlight decoder, using greedy decoder with lexicon lookup")
-        return None
             
         try:
             # Load tokens dictionary
@@ -228,8 +243,14 @@ class CTCDecoder:
             # Build trie from lexicon
             trie = Trie(token_dict.index_size(), word_dict.index_size())
             
+            trie_insertions = 0
+            failed_insertions = 0
             for word, spellings in lexicon.items():
                 word_idx = word_dict.get_index(word)
+                if word_idx == -1:
+                    failed_insertions += 1
+                    continue
+                    
                 for spelling in spellings:
                     # Convert spelling (list of tokens) to token indices
                     spelling_indices = []
@@ -237,19 +258,19 @@ class CTCDecoder:
                         token_idx = token_dict.get_index(token)
                         if token_idx != -1:  # Valid token
                             spelling_indices.append(token_idx)
+                        else:
+                            print(f"DEBUG: Unknown token '{token}' in word '{word}' spelling {spelling}")
                     
                     if spelling_indices:  # Only add if we have valid tokens
                         trie.insert(spelling_indices, word_idx, 0.0)  # score = 0.0
+                        trie_insertions += 1
+                        
             
             # Create language model
-            if self.lm_path and os.path.exists(self.lm_path):
-                # Load KenLM model
-                lm = LM(self.lm_path)
-                print("Loaded KenLM language model")
-            else:
-                # Use zero language model (no LM)
-                lm = ZeroLM()
-                print("Using ZeroLM (no language model)")
+            # For now, use ZeroLM to avoid KenLM constructor issues
+            # TODO: Fix KenLM integration once we resolve the API changes
+            lm = ZeroLM()
+            print("Using ZeroLM (no language model) - KenLM integration temporarily disabled")
             
             # Set up decoder options
             decoder_opts = LexiconDecoderOptions(
@@ -265,11 +286,11 @@ class CTCDecoder:
             )
             
             # Find token indices for special tokens
+            # Flashlight automatically adds <unk> at the end with index len(lexicon)
             unk_token_idx = word_dict.get_index(self.unk_word)
             if unk_token_idx == -1:
-                unk_token_idx = word_dict.get_index("<unk>")
-            if unk_token_idx == -1:
-                unk_token_idx = 0  # Fallback
+                # If not found, it should be at index len(lexicon) per Flashlight's loadWords
+                unk_token_idx = len(lexicon)
             
             # Build decoder with new API
             decoder = LexiconDecoder(
@@ -282,6 +303,12 @@ class CTCDecoder:
                 [],                # transitions (empty for CTC)
                 False              # is_token_lm
             )
+            
+            # Store dictionaries for word mapping
+            self.token_dict = token_dict
+            self.word_dict = word_dict
+            self.trie = trie
+            self.lm = lm
             
             print("Built Flashlight CTC decoder with lexicon")
             return decoder
@@ -320,6 +347,10 @@ class CTCDecoder:
         
         batch_size, seq_len, vocab_size = logits.shape
         
+        # Also treat batch_size=1 as single sequence for convenience
+        if batch_size == 1:
+            single_sequence = True
+        
         # Default lengths to full sequences if not provided
         if logit_lengths is None:
             logit_lengths = torch.full((batch_size,), seq_len, dtype=torch.long)
@@ -330,35 +361,78 @@ class CTCDecoder:
         
         results = []
         
-        if self.decoder is not None and FLASHLIGHT_AVAILABLE:
+        # Re-enable Flashlight decoder with corrected emission format
+        if self.decoder is not None and FLASHLIGHT_AVAILABLE and hasattr(self, 'word_dict'):
             try:
                 # Use Flashlight CTC decoder
                 for i in range(batch_size):
                     seq_len = logit_lengths[i].item()
                     logit_seq = logits[i, :seq_len].cpu().numpy()  # [time, vocab]
                     
-                    # Flashlight expects log probabilities
-                    log_probs = torch.log_softmax(torch.from_numpy(logit_seq), dim=-1).numpy()
+                    # Flashlight expects LOG PROBABILITIES in [T, N] format where N is vocab size
+                    # Convert raw logits to log probabilities (log-softmax)
+                    log_probs = torch.log_softmax(torch.from_numpy(logit_seq), dim=-1).numpy().astype(np.float32)
                     
-                    # Decode with Flashlight
-                    decoder_results = self.decoder.decode(log_probs.T)  # Flashlight expects [vocab, time]
+                    
+                    # Decode with Flashlight - API expects emissions pointer, T (time), N (vocab_size)  
+                    emissions_ptr = log_probs.ctypes.data  # Keep [T, N] format with log probabilities
+                    T = log_probs.shape[0]  # time steps
+                    N = log_probs.shape[1]  # vocabulary size (not batch size!)
+                    
+                    
+                    decoder_results = self.decoder.decode(emissions_ptr, T, N)
                     
                     if decoder_results:
                         # Get best hypothesis
                         best_result = decoder_results[0]
-                        words = [self.tokens[idx] for idx in best_result.tokens if idx < len(self.tokens)]
-                        tokens = words  # For CTC, tokens are the same as words at phone level
+                        
+                        # Map word IDs to actual words
+                        word_ids = best_result.words
+                        token_ids = best_result.tokens
+                        
+                        words = []
+                        for word_id in word_ids:
+                            try:
+                                word = self.word_dict.get_entry(word_id)
+                                words.append(word)
+                            except:
+                                # Fallback if word mapping fails
+                                words.append(f"<unk_{word_id}>")
+                        
+                        # Map token IDs to phonemes
+                        tokens = []
+                        for token_id in token_ids:
+                            if token_id < len(self.tokens):
+                                tokens.append(self.tokens[token_id])
+                        
                         score = best_result.score
+                        sentence = ' '.join(words)
                         
                         # Get n-best if available
                         nbest_results = []
                         for j, result in enumerate(decoder_results[:self.nbest]):
-                            result_tokens = [self.tokens[idx] for idx in result.tokens if idx < len(self.tokens)]
+                            result_words = []
+                            result_tokens = []
+                            
+                            # Map words
+                            for word_id in result.words:
+                                try:
+                                    word = self.word_dict.get_entry(word_id)
+                                    result_words.append(word)
+                                except:
+                                    result_words.append(f"<unk_{word_id}>")
+                            
+                            # Map tokens
+                            for token_id in result.tokens:
+                                if token_id < len(self.tokens):
+                                    result_tokens.append(self.tokens[token_id])
+                            
                             nbest_results.append({
-                                'words': result_tokens,
+                                'words': result_words,
                                 'tokens': result_tokens,
                                 'score': result.score,
-                                'rank': j
+                                'rank': j,
+                                'sentence': ' '.join(result_words)
                             })
                         
                         results.append({
@@ -366,7 +440,7 @@ class CTCDecoder:
                             'tokens': tokens,
                             'score': score,
                             'nbest': nbest_results,
-                            'sentence': ' '.join(words) if words else ''
+                            'sentence': sentence
                         })
                     else:
                         # Empty result
@@ -494,44 +568,80 @@ class CTCDecoder:
 
 
 def test_decoder():
-    """Test the CTC decoder with dummy data."""
+    """Test the CTC decoder with real data."""
     print("Testing CTC decoder...")
     
-    # Create dummy tokens and lexicon files
-    os.makedirs("artifacts", exist_ok=True)
+    # Test with actual artifacts
+    current_dir = Path(__file__).parent
+    artifacts_dir = current_dir.parent / "artifacts"
     
-    # Dummy tokens
-    with open("artifacts/test_tokens.txt", "w") as f:
-        f.write("BLANK\nAA\nAE\nAH\nSIL\n")
+    # Check if artifacts exist
+    tokens_path = artifacts_dir / "tokens.txt"
+    lexicon_path = artifacts_dir / "lexicon.txt"
     
-    # Dummy lexicon  
-    with open("artifacts/test_lexicon.txt", "w") as f:
-        f.write("hello AH\nworld AA AE\n")
+    if not tokens_path.exists():
+        print(f"Error: {tokens_path} not found")
+        return
+    if not lexicon_path.exists():
+        print(f"Error: {lexicon_path} not found")
+        return
     
     # Initialize decoder
-    decoder = CTCDecoder(
-        tokens_path="artifacts/test_tokens.txt",
-        lexicon_path="artifacts/test_lexicon.txt",
-        lm_path=None,  # No LM for test
-        beam_size=10,
-        silence_token="SIL"
-    )
+    try:
+        decoder = CTCDecoder(
+            tokens_path=str(tokens_path),
+            lexicon_path=str(lexicon_path),
+            lm_path=None,  # No LM for test
+            beam_size=10
+        )
+        print("✓ Decoder initialized successfully")
+    except Exception as e:
+        print(f"✗ Failed to initialize decoder: {e}")
+        return
     
-    # Create dummy logits
-    batch_size, seq_len, vocab_size = 1, 20, 5
-    logits = torch.randn(batch_size, seq_len, vocab_size)
+    # Create test logits that should produce recognizable phonemes
+    # Let's create logits that strongly favor specific phonemes
+    vocab_size = len(decoder.tokens)
+    seq_len = 10
+    logits = torch.zeros(1, seq_len, vocab_size)
+    
+    # Create a simple pattern: BLANK, AH, BLANK, M, BLANK, AH, BLANK (should be "am a" or similar)
+    blank_idx = decoder.blank_idx
+    
+    # Find some phoneme indices
+    ah_idx = decoder.token_to_idx.get('AH', 1)
+    m_idx = decoder.token_to_idx.get('M', 2)
+    
+    # Set high probabilities for specific tokens at specific times
+    logits[0, 0, blank_idx] = 10.0  # BLANK
+    logits[0, 1, ah_idx] = 10.0     # AH
+    logits[0, 2, blank_idx] = 10.0  # BLANK  
+    logits[0, 3, m_idx] = 10.0      # M
+    logits[0, 4, blank_idx] = 10.0  # BLANK
+    logits[0, 5, ah_idx] = 10.0     # AH
+    logits[0, 6, blank_idx] = 10.0  # BLANK
+    logits[0, 7, blank_idx] = 10.0  # BLANK
+    logits[0, 8, blank_idx] = 10.0  # BLANK
+    logits[0, 9, blank_idx] = 10.0  # BLANK
     
     # Decode
-    results = decoder.decode(logits)
-    
-    # Results is a list with one element for single sequence
-    result = results[0] if isinstance(results, list) else results
-    
-    print(f"Decoded result:")
-    print(f"  Tokens: {result['tokens']}")
-    print(f"  Words: {result['words']}")
-    print(f"  Sentence: {result['sentence']}")
-    print(f"  Score: {result['score']}")
+    try:
+        result = decoder.decode(logits)
+        print("✓ Decoding completed")
+        print(f"  Tokens: {result['tokens']}")
+        print(f"  Words: {result['words']}")  
+        print(f"  Sentence: '{result['sentence']}'")
+        print(f"  Score: {result['score']}")
+        
+        if result['words']:
+            print("✓ Successfully produced words from phonemes")
+        else:
+            print("⚠ No words produced")
+            
+    except Exception as e:
+        print(f"✗ Decoding failed: {e}")
+        import traceback
+        traceback.print_exc()
     
     print("CTC decoder test completed!")
 
