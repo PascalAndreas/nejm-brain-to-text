@@ -23,20 +23,24 @@ language_model:
   # Currently active model (change this to switch models)
   active_model: models/language_models/nvidia_tao_v4.1/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
 
-# CTC Decoder parameters (based on legacy system research)
+# CTC Decoder configuration
 decoder:
-  # Core parameters (aggressive settings for debugging)
-  lm_weight: 0.0       # Language model weight (disabled for testing)
-  word_score: 0.0      # Word insertion bonus/penalty (neutral)
-  beam_size: 100       # Number of beams in search (much larger)
-  beam_size_token: 50  # Token-level beam size (much larger)
-  beam_threshold: 10.0 # Pruning threshold (much more permissive)
-  nbest: 100          # number of n-best hypotheses
+  # Decoder backend preference (auto, flashlight, greedy)
+  backend: "flashlight"
   
   # Token definitions (matching evaluate_model_helpers.py)
   blank_token: "BLANK"
   silence_token: "SIL" 
   unk_word: "<unk>"
+
+# Flashlight decoder parameters (optimized from focused parameter search)
+flashlight:
+  lm_weight: 1.4       # Optimal LM weight confirmed by search
+  word_score: -0.6     # Stronger word penalty - best result from search
+  beam_size: 150       # Optimal beam size - larger isn't better
+  beam_size_token: 25  # Token-level beam size
+  beam_threshold: 15.0  # Pruning threshold
+  nbest: 100           # number of n-best hypotheses
 
 # Lexicon building configuration
 lexicon:

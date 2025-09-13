@@ -17,57 +17,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="g2p_en")
 
 from g2p_en import G2p
 
-# Add parent directory to path to import nejm_b2txt_utils
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from nejm_b2txt_utils.general_utils import remove_punctuation
-
-# Import the correct phoneme mapping from evaluate_model_helpers.py
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model_training'))
-from evaluate_model_helpers import LOGIT_TO_PHONEME
-
-
-# Phone mapping from CMUdict ARPAbet to our 39-phone set
-PHONE_MAPPING = {
-    # Vowels - remove stress digits and map allophones
-    'AA0': 'AA', 'AA1': 'AA', 'AA2': 'AA',
-    'AE0': 'AE', 'AE1': 'AE', 'AE2': 'AE', 
-    'AH0': 'AH', 'AH1': 'AH', 'AH2': 'AH',
-    'AO0': 'AO', 'AO1': 'AO', 'AO2': 'AO',
-    'AW0': 'AW', 'AW1': 'AW', 'AW2': 'AW',
-    'AY0': 'AY', 'AY1': 'AY', 'AY2': 'AY',
-    'EH0': 'EH', 'EH1': 'EH', 'EH2': 'EH',
-    'ER0': 'ER', 'ER1': 'ER', 'ER2': 'ER',
-    'EY0': 'EY', 'EY1': 'EY', 'EY2': 'EY',
-    'IH0': 'IH', 'IH1': 'IH', 'IH2': 'IH',
-    'IY0': 'IY', 'IY1': 'IY', 'IY2': 'IY',
-    'OW0': 'OW', 'OW1': 'OW', 'OW2': 'OW',
-    'OY0': 'OY', 'OY1': 'OY', 'OY2': 'OY',
-    'UH0': 'UH', 'UH1': 'UH', 'UH2': 'UH',
-    'UW0': 'UW', 'UW1': 'UW', 'UW2': 'UW',
-    
-    # Allophone mappings
-    'AX': 'AH',   # schwa -> AH
-    'IX': 'IH',   # barred i -> IH  
-    'AXR': 'ER',  # schwa+r -> ER
-    'UX': 'UW',   # high back -> UW
-    
-    # Consonants
-    'B': 'B', 'CH': 'CH', 'D': 'D', 'DH': 'DH', 'F': 'F', 'G': 'G',
-    'HH': 'HH', 'JH': 'JH', 'K': 'K', 'L': 'L', 'M': 'M', 'N': 'N',
-    'NG': 'NG', 'P': 'P', 'R': 'R', 'S': 'S', 'SH': 'SH', 'T': 'T',
-    'TH': 'TH', 'V': 'V', 'W': 'W', 'Y': 'Y', 'Z': 'Z', 'ZH': 'ZH',
-    
-    # Flap mapping
-    'DX': 'T',    # flap -> T
-    
-    # Syllabic consonants
-    'EN': 'N', 'NX': 'N',  # syllabic n -> N
-    'EM': 'M',             # syllabic m -> M
-    'EL': 'L',             # syllabic l -> L
-    
-    # Alternative consonant forms
-    'H': 'HH',    # alternative H -> HH
-}
+from decoding.helpers import LOGIT_TO_PHONEME, PHONE_MAPPING
 
 
 def download_cmudict(cache_path: str = "artifacts/cmudict.dict") -> str:

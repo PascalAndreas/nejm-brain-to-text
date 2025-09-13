@@ -21,7 +21,7 @@ from jiwer import cer, wer
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from decoding.decode_ctc import CTCDecoder
+from decoding import Decoder
 from decoding import DEFAULT_CONFIG
 from model_training.evaluate_model_helpers import LOGIT_TO_PHONEME
 from nejm_b2txt_utils.general_utils import remove_punctuation
@@ -191,7 +191,7 @@ def test_ctc_pipeline_with_ground_truth(
     # Initialize decoder with custom parameters if provided
     if verbose:
         print("\n🔧 Initializing CTC decoder...")
-    decoder = CTCDecoder(
+    decoder = Decoder(
         lm_weight=lm_weight,
         word_score=word_score,
         beam_size=beam_size
@@ -302,18 +302,19 @@ def test_ctc_pipeline_with_ground_truth(
                     print(f"Tokens: {' '.join(predicted_tokens[:20])}{'...' if len(predicted_tokens) > 20 else ''}")
 
                     # Print nbest alternatives if available
-                    if isinstance(decoded_results, list) and len(decoded_results) > 1:
-                        print(f"N-best alternatives:")
-                        for i, alt_result in enumerate(decoded_results[1:min(4, len(decoded_results))], 1):
-                            alt_text = alt_result.get('sentence', alt_result.get('text', 'N/A'))
+                    nbest_results = result.get('nbest', [])
+                    if nbest_results and len(nbest_results) > 1:
+                        print(f"N-best alternatives ({len(nbest_results)} total):")
+                        for i, alt_result in enumerate(nbest_results[:4], 1):
+                            alt_text = alt_result.get('sentence', 'N/A')
                             alt_score = alt_result.get('score', 'N/A')
                             print(f"  {i}. '{alt_text}' (score: {alt_score})")
-                        if len(decoded_results) > 4:
-                            print(f"  ... and {len(decoded_results) - 4} more")
-                    elif isinstance(decoded_results, list) and len(decoded_results) == 1:
+                        if len(nbest_results) > 4:
+                            print(f"  ... and {len(nbest_results) - 4} more")
+                    elif nbest_results and len(nbest_results) == 1:
                         print("N-best: Only one result available")
                     else:
-                        print("N-best: Not a list or single result")
+                        print("N-best: No alternative results available")
                 
                 # Calculate metrics if we have ground truth text
                 if gt_text and predicted_text != 'N/A':
@@ -432,7 +433,7 @@ def parse_args():
     parser.add_argument(
         '--time_expansion', 
         type=float, 
-        default=2.0,
+        default=1.3,
         help='How much longer the time sequence should be vs phonemes'
     )
     
@@ -446,7 +447,7 @@ def parse_args():
     parser.add_argument(
         '--blank_probability', 
         type=float, 
-        default=0.3,
+        default=0,
         help='Probability of inserting blanks between phonemes'
     )
     

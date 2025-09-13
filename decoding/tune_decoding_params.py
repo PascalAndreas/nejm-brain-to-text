@@ -20,7 +20,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model_training.rnn_model import GRUDecoder
 from model_training.evaluate_model_helpers import load_h5py_file, runSingleDecodingStep
-from decode_ctc import CTCDecoder
+from model_training.data_augmentations import gauss_smooth  # Fix import issue
+from . import Decoder
 from nejm_b2txt_utils.general_utils import calculate_aggregate_error_rate, remove_punctuation
 
 try:
@@ -51,7 +52,7 @@ def load_model_and_data(model_path: str, data_dir: str, device: torch.device):
     model_args = OmegaConf.load(os.path.join(model_path, 'checkpoint/args.yaml'))
     
     # Load CSV metadata
-    csv_path = os.path.join(os.path.dirname(data_dir), 't15_copyTaskData_description.csv')
+    csv_path = os.path.join('data', 't15_copyTaskData_description.csv')
     b2txt_csv_df = pd.read_csv(csv_path)
     
     # Initialize model
@@ -68,7 +69,8 @@ def load_model_and_data(model_path: str, data_dir: str, device: torch.device):
     )
     
     # Load model weights
-    checkpoint = torch.load(os.path.join(model_path, 'checkpoint/best_checkpoint'), weights_only=False)
+    checkpoint = torch.load(os.path.join(model_path, 'checkpoint/best_checkpoint'), 
+                          weights_only=False, map_location=device)
     # Clean up keys (remove module. and _orig_mod. prefixes)
     state_dict = {}
     for key, value in checkpoint['model_state_dict'].items():
@@ -115,7 +117,7 @@ def get_model_logits(model, model_args, val_data, device):
                 # Get neural input
                 neural_input = data['neural_features'][trial]
                 neural_input = np.expand_dims(neural_input, axis=0)
-                neural_input = torch.tensor(neural_input, device=device, dtype=torch.bfloat16)
+                neural_input = torch.tensor(neural_input, device=device, dtype=torch.float32)
                 
                 # Run model
                 logits = runSingleDecodingStep(neural_input, input_layer, model, model_args, device)
@@ -129,10 +131,10 @@ def decode_with_params(val_data, lm_weight, word_score, config):
     logger = logging.getLogger(__name__)
     
     # Initialize decoder with current parameters
-    decoder = CTCDecoder(
-        tokens_txt=config.artifacts.tokens_txt,
-        lexicon_txt=config.artifacts.lexicon_txt,
-        kenlm_path=config.language_model.active_model,
+    decoder = Decoder(
+        tokens_path=config.artifacts.tokens_txt,
+        lexicon_path=config.artifacts.lexicon_txt,
+        lm_path=config.language_model.active_model,
         lm_weight=lm_weight,
         word_score=word_score,
         beam_size=config.decoder.get('beam_size', 17),

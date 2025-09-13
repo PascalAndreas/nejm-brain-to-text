@@ -20,9 +20,9 @@ from test_gt_phonemes import test_ctc_pipeline_with_ground_truth
 
 
 def run_grid_search(
-    lm_weights=[0.0, 0.1, 0.2],  # Start from 0.0 which worked
-    word_scores=[-1.0, 0.0, 1.0],  # Around neutral which worked
-    beam_sizes=[50, 100, 150],  # Large beams which worked
+    lm_weights=[0.4, 0.5],  # Start from 0.0 which worked
+    word_scores=[-5.0, -4.0, -3.0],
+    beam_sizes=[200, 300, 400],  # Large beams which worked
     num_samples=8,  # Reasonable sample size
     perfection=0.90,
     time_expansion=2.0,
@@ -176,7 +176,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Run hyperparameter grid search for CTC decoding")
-    parser.add_argument('--samples', type=int, default=20, help='Number of samples per configuration')
+    parser.add_argument('--samples', type=int, default=30, help='Number of samples per configuration')
     parser.add_argument('--output', type=str, default='hyperparameter_results.csv', help='Output CSV file')
     parser.add_argument('--perfect_one_hot', action='store_true', help='Generate perfect one-hot logits with no noise')
     args = parser.parse_args()

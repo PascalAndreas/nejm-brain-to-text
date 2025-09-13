@@ -16,7 +16,10 @@ DEFAULT_CONFIG = OmegaConf.load(_config_path)
 from .build_tokens import build_tokens
 from .build_lexicon import build_lexicon, extract_lm_vocabulary_from_lexicon
 from .filter_lm import filter_language_model
-from .decode_ctc import CTCDecoder
+from .decoder import Decoder, create_decoder
+from .flashlight import FlashlightCTCDecoder
+from .greedy import GreedyCTCDecoder
+from . import helpers
 
 # Note: tune_decoding_params has dependencies on model_training, 
 # so it's not imported here to avoid circular imports
@@ -27,5 +30,9 @@ __all__ = [
     'build_lexicon',
     'extract_lm_vocabulary_from_lexicon', 
     'filter_language_model',
-    'CTCDecoder'
+    'Decoder',
+    'create_decoder',
+    'FlashlightCTCDecoder',
+    'GreedyCTCDecoder',
+    'helpers'
 ]

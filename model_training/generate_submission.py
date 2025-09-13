@@ -20,7 +20,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rnn_model import GRUDecoder
 from evaluate_model_helpers import load_h5py_file, runSingleDecodingStep
-from decoding import CTCDecoder
+from decoding import Decoder
 from nejm_b2txt_utils.general_utils import remove_punctuation
 
 try:
@@ -134,7 +134,7 @@ def decode_all_trials(eval_data, decoder_config, submission_config):
     logger = logging.getLogger(__name__)
     
     # Initialize decoder
-    decoder = CTCDecoder(
+    decoder = Decoder(
         tokens_path=decoder_config['tokens_txt'],
         lexicon_path=decoder_config['lexicon_txt'],
         lm_path=decoder_config.get('kenlm_path'),
