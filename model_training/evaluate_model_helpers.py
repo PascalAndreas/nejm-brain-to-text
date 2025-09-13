@@ -4,7 +4,7 @@ import h5py
 import time
 import re
 
-from data_augmentations import gauss_smooth
+from model_training.data_augmentations import gauss_smooth
 
 LOGIT_TO_PHONEME = [
     'BLANK',

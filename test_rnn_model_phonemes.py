@@ -22,7 +22,8 @@ from pathlib import Path
 from jiwer import cer, wer
 
 # Add project root to path
-sys.path.append('/Users/pascalandreas/Documents/repositories/nejm-brain-to-text')
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
 
 from model_training.rnn_model import GRUDecoder
 from model_training.data_augmentations import gauss_smooth
@@ -284,9 +285,10 @@ def main():
     args = parser.parse_args()
 
     # Paths
-    model_path = '/Users/pascalandreas/Documents/repositories/nejm-brain-to-text/data/t15_pretrained_rnn_baseline/t15_pretrained_rnn_baseline'
-    data_dir = '/Users/pascalandreas/Documents/repositories/nejm-brain-to-text/data/t15_copyTask_neuralData/hdf5_data_final'
-    tokens_path = '/Users/pascalandreas/Documents/repositories/nejm-brain-to-text/artifacts/tokens.txt'
+    project_root = Path(__file__).parent
+    model_path = project_root / 'data/t15_pretrained_rnn_baseline/t15_pretrained_rnn_baseline'
+    data_dir = project_root / 'data/t15_copyTask_neuralData/hdf5_data_final'
+    tokens_path = project_root / 'artifacts/tokens.txt'
     
     # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

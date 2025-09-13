@@ -5,9 +5,11 @@ Quick test of current decoder performance on 50 samples with RNN model.
 
 import sys
 import os
-sys.path.append('.')
-sys.path.append('model_training')
-sys.path.append('decoding')
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
 
 import torch
 import numpy as np
@@ -65,26 +67,20 @@ def test_current_performance(num_samples=50):
     print("✅ Model loaded successfully")
     
     # Initialize decoder with current config
-    config_path = os.path.join('decoding', 'config.yaml')
-    config = OmegaConf.load(config_path)
     
-    decoder = Decoder(
-        tokens_path=config.artifacts.tokens_txt,
-        lexicon_path=config.artifacts.lexicon_txt,
-        lm_path=config.language_model.active_model,
-        lm_weight=config.decoder.lm_weight,
-        word_score=config.decoder.word_score,
-        beam_size=config.decoder.beam_size,
-        beam_size_token=config.decoder.beam_size_token,
-        beam_threshold=config.decoder.beam_threshold,
-        nbest=config.decoder.nbest,
-        blank_token=config.decoder.blank_token,
-        silence_token=config.decoder.silence_token,
-        unk_word=config.decoder.unk_word
-    )
+    decoder = Decoder()
     
     print("✅ Decoder initialized successfully")
-    print(f"⚙️  Config: lm_weight={config.decoder.lm_weight}, word_score={config.decoder.word_score}, beam_size={config.decoder.beam_size}")
+    print(f"⚙️  Decoder type: {decoder.decoder_type}")
+    
+    # Try to get config info if available
+    try:
+        if hasattr(decoder.decoder_instance, 'lm_weight'):
+            print(f"⚙️  Config: lm_weight={decoder.decoder_instance.lm_weight}, word_score={decoder.decoder_instance.word_score}, beam_size={decoder.decoder_instance.beam_size}")
+        else:
+            print("⚙️  Using greedy decoder (no beam search parameters)")
+    except AttributeError:
+        print("⚙️  Decoder config not accessible")
     
     # Load validation data from multiple sessions to get enough samples
     all_data = {'neural_features': [], 'sentence_label': []}

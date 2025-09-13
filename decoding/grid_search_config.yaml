@@ -1,0 +1,19 @@
+# Sample grid search configuration for decoder hyperparameters
+
+decoder_type: flashlight
+
+# Parameter grid - each parameter will be tested with all combinations
+param_grid:
+  lm_weight: [0.5, 1.0, 1.5, 2.0]
+  word_score: [-1.0, -0.5, 0.0, 0.5]
+  beam_size: [100, 500, 1000]
+  beam_size_token: [50, 100, 200]
+
+# Number of test samples to evaluate on
+num_samples: 50
+
+# Output directory for results and visualizations
+output_dir: "grid_search_results"
+
+# Optional: specify which metrics to optimize for
+primary_metric: "avg_wer"  # or "avg_cer"
