@@ -35,11 +35,11 @@ decoder:
 
 # Flashlight decoder parameters (optimized from focused parameter search)
 flashlight:
-  lm_weight: 2.375       # Optimal LM weight confirmed by search
+  lm_weight: 4.5       # Optimal LM weight confirmed by search
   word_score: -0.7     # Stronger word penalty - best result from search
   beam_size: 100       # Optimal beam size - larger isn't better
   beam_size_token: 25  # Token-level beam size
-  beam_threshold: 22.0  # Pruning threshold
+  beam_threshold: 24.0  # Pruning threshold
   nbest: 100           # number of n-best hypotheses
   sil_score: -0.275      # Silence token penalty/bonus
   log_add: false       # Use simple log addition (faster)
@@ -78,13 +78,13 @@ tuning:
   # Parameter grids by decoder type
   flashlight: # Best WER on 500 samples: 0.032
     # Fine-tune around optimal lm_weight=2.25 +
-    lm_weight: [2.6, 2.8, 3.0, 3.2]  # Narrow range around best: 2.6 beat 2.5, can we go higher?
+    lm_weight: [4.0, 4.5, 5.0]  # Narrow range around best: 2.6 beat 2.5, can we go higher?
     
     # Fine-tune around optimal word_score= -0.7
     # word_score: [-0.75, -0.7, -0.65]  # Narrow range around best: -0.7 WINS!!!
     
     # Fine-tune around optimal beam_threshold=22.0
-    beam_threshold: [21.0, 22.0, 23.0]  # Narrow range around best: 22.0 WINS!!!
+    # beam_threshold: [23.0, 25.0]  # Narrow range around best: 22.0 WINS!!!
     
     # Tune silence score (can significantly impact word boundaries)
     # sil_score: [-0.325, -0.3, -0.275]  # Best found: -0.275

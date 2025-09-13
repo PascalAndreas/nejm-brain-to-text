@@ -19,17 +19,17 @@ from pathlib import Path
 from typing import Dict, List, Any, Tuple
 import csv
 import torch
-import h5py
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from jiwer import wer, cer
 from omegaconf import OmegaConf
-import random
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from decoding.decoder import Decoder
+from dataset import BrainToTextDataset, collate_fn
 from model_training.rnn_model import GRUDecoder
 from model_training.data_augmentations import gauss_smooth
 from nejm_b2txt_utils.general_utils import remove_punctuation
@@ -60,7 +60,7 @@ class GridSearchRunner:
         # Load RNN model for generating logits
         self.rnn_model, self.rnn_args = self._load_rnn_model()
         
-        # Load test data
+        # Load test data using new dataset
         self.test_samples = self._load_test_samples()
         
         print(f"Initialized GridSearchRunner:")
@@ -107,86 +107,58 @@ class GridSearchRunner:
         return model, model_args
     
     def _load_test_samples(self):
-        """Load test samples from neural data across multiple days."""
-        # Create mapping from session names to day indices
-        sessions = self.rnn_args['dataset']['sessions']
-        session_to_day_idx = {session: idx for idx, session in enumerate(sessions)}
+        """Load test samples using the new dataset class."""
+        # Create dataset for validation data
+        dataset = BrainToTextDataset(
+            data_root=str(project_root / "data" / "t15_copyTask_neuralData"),
+            split='val',
+            random_seed=42  # For reproducible sampling
+        )
         
-        # Get available data directories
-        data_base_dir = project_root / "data" / "t15_copyTask_neuralData" / "hdf5_data_final"
-        available_sessions = []
+        print(f"Found {len(dataset)} total validation trials")
         
-        for session_dir in data_base_dir.iterdir():
-            if session_dir.is_dir() and session_dir.name in session_to_day_idx:
-                train_file = session_dir / "data_val.hdf5"
-                if train_file.exists():
-                    available_sessions.append((session_dir.name, train_file, session_to_day_idx[session_dir.name]))
+        # Create DataLoader with shuffling to get random samples
+        dataloader = DataLoader(
+            dataset,
+            batch_size=min(self.num_samples, len(dataset)),
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=0
+        )
         
-        available_sessions.sort(key=lambda x: x[2])  # Sort by day index
-        print(f"Found {len(available_sessions)} available sessions with training data")
+        # Get one batch of samples
+        batch = next(iter(dataloader))
         
-        # First, collect all available trials with their metadata
-        all_trials = []
-        for session_name, data_file, day_idx in available_sessions:
-            with h5py.File(data_file, 'r') as f:
-                trial_keys = [k for k in f.keys() if k.startswith('trial_')]
-                
-                for trial_key in trial_keys:
-                    trial_group = f[trial_key]
-                    
-                    # Extract ground truth text to filter valid trials
-                    sentence_label = trial_group.attrs.get('sentence_label', '')
-                    transcription = None
-                    if 'transcription' in trial_group:
-                        transcription = trial_group['transcription'][:]
-                    
-                    gt_text = self._extract_ground_truth_text(transcription, sentence_label)
-                    
-                    if gt_text:  # Only include trials with ground truth
-                        all_trials.append({
-                            'session_name': session_name,
-                            'data_file': data_file,
-                            'day_idx': day_idx,
-                            'trial_key': trial_key,
-                            'gt_text': gt_text
-                        })
-        
-        print(f"Found {len(all_trials)} total valid trials across {len(available_sessions)} sessions")
-        
-        # Randomly sample the requested number of trials
-        if len(all_trials) > self.num_samples:
-            selected_trials = random.sample(all_trials, self.num_samples)
-        else:
-            selected_trials = all_trials
-            print(f"Warning: Only {len(all_trials)} trials available, using all of them")
-        
-        # Now load the actual data for selected trials
+        # Convert batch format to the format expected by the rest of the code
         samples = []
-        session_counts = {}
-        
-        for trial_info in selected_trials:
-            with h5py.File(trial_info['data_file'], 'r') as f:
-                trial_group = f[trial_info['trial_key']]
-                neural_features = trial_group['input_features'][:]
-                
+        for i in range(len(batch['sessions'])):
+            # Extract ground truth text
+            gt_text = self._extract_ground_truth_text(
+                batch['transcriptions'][i], 
+                batch['sentence_labels'][i]
+            )
+            
+            if gt_text:  # Only include trials with valid ground truth
                 samples.append({
-                    'trial_key': trial_info['trial_key'],
-                    'neural_features': neural_features,
-                    'gt_text': trial_info['gt_text'],
-                    'day_idx': trial_info['day_idx'],
-                    'session_name': trial_info['session_name']
+                    'neural_features': batch['input_features'][i].numpy(),
+                    'gt_text': gt_text,
+                    'day_idx': batch['day_indices'][i].item(),
+                    'session_name': batch['sessions'][i],
+                    'trial_key': f"trial_{batch['trial_nums'][i]:04d}"
                 })
-                
-                # Count samples per session for reporting
-                session_name = trial_info['session_name']
-                session_counts[session_name] = session_counts.get(session_name, 0) + 1
         
         # Report the distribution
+        session_counts = {}
+        for sample in samples:
+            session_name = sample['session_name']
+            session_counts[session_name] = session_counts.get(session_name, 0) + 1
+        
         for session_name, count in sorted(session_counts.items()):
             day_idx = next(s['day_idx'] for s in samples if s['session_name'] == session_name)
             print(f"Loaded {count} samples from {session_name} (day_idx={day_idx})")
         
-        print(f"Loaded {len(samples)} total test samples with ground truth from {len(set(s['day_idx'] for s in samples))} days")
+        unique_days = len(set(s['day_idx'] for s in samples))
+        print(f"Loaded {len(samples)} total test samples with ground truth from {unique_days} days")
         return samples
     
     def _extract_ground_truth_text(self, transcription, sentence_label):

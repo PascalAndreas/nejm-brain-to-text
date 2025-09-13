@@ -1,0 +1,61 @@
+# Dataset configuration for brain-to-text data
+# This defines the session order used for day indexing to ensure consistency
+# with the pretrained RNN model and decoder grid search
+
+# Session order for day indexing (day_idx = index in this list)
+# This matches the order used in the pretrained RNN model
+sessions:
+  - t15.2023.08.11  # day_idx=0  (post-implant day 25)
+  - t15.2023.08.13  # day_idx=1  (post-implant day 27)
+  - t15.2023.08.18  # day_idx=2  (post-implant day 32)
+  - t15.2023.08.20  # day_idx=3  (post-implant day 34)
+  - t15.2023.08.25  # day_idx=4  (post-implant day 39)
+  - t15.2023.08.27  # day_idx=5  (post-implant day 41)
+  - t15.2023.09.01  # day_idx=6  (post-implant day 46)
+  - t15.2023.09.03  # day_idx=7  (post-implant day 48)
+  - t15.2023.09.24  # day_idx=8  (post-implant day 69)
+  - t15.2023.09.29  # day_idx=9  (post-implant day 74)
+  - t15.2023.10.01  # day_idx=10 (post-implant day 76)
+  - t15.2023.10.06  # day_idx=11 (post-implant day 81)
+  - t15.2023.10.08  # day_idx=12 (post-implant day 83)
+  - t15.2023.10.13  # day_idx=13 (post-implant day 88)
+  - t15.2023.10.15  # day_idx=14 (post-implant day 90)
+  - t15.2023.10.20  # day_idx=15 (post-implant day 95)
+  - t15.2023.10.22  # day_idx=16 (post-implant day 97)
+  - t15.2023.11.03  # day_idx=17 (post-implant day 109)
+  - t15.2023.11.04  # day_idx=18 (post-implant day 110)
+  - t15.2023.11.17  # day_idx=19 (post-implant day 123)
+  - t15.2023.11.19  # day_idx=20 (post-implant day 125)
+  - t15.2023.11.26  # day_idx=21 (post-implant day 132)
+  - t15.2023.12.03  # day_idx=22 (post-implant day 139)
+  - t15.2023.12.08  # day_idx=23 (post-implant day 144)
+  - t15.2023.12.10  # day_idx=24 (post-implant day 146)
+  - t15.2023.12.17  # day_idx=25 (post-implant day 153)
+  - t15.2023.12.29  # day_idx=26 (post-implant day 165)
+  - t15.2024.02.25  # day_idx=27 (post-implant day 223)
+  - t15.2024.03.03  # day_idx=28 (post-implant day 230)
+  - t15.2024.03.08  # day_idx=29 (post-implant day 235)
+  - t15.2024.03.15  # day_idx=30 (post-implant day 242)
+  - t15.2024.03.17  # day_idx=31 (post-implant day 244)
+  - t15.2024.04.25  # day_idx=32 (post-implant day 283)
+  - t15.2024.04.28  # day_idx=33 (post-implant day 286)
+  - t15.2024.05.10  # day_idx=34 (post-implant day 298)
+  - t15.2024.06.14  # day_idx=35 (post-implant day 333)
+  - t15.2024.07.19  # day_idx=36 (post-implant day 368)
+  - t15.2024.07.21  # day_idx=37 (post-implant day 370)
+  - t15.2024.07.28  # day_idx=38 (post-implant day 377)
+  - t15.2025.01.10  # day_idx=39 (post-implant day 543)
+  - t15.2025.01.12  # day_idx=40 (post-implant day 545)
+  - t15.2025.03.14  # day_idx=41 (post-implant day 606)
+  - t15.2025.03.16  # day_idx=42 (post-implant day 608)
+  - t15.2025.03.30  # day_idx=43 (post-implant day 622)
+  - t15.2025.04.13  # day_idx=44 (post-implant day 636)
+
+# Available corpus types for filtering
+corpus_types:
+  - "50-Word"
+  - "Switchboard"
+  - "Openwebtext"
+  - "Random"
+  - "Harvard"
+  - "Freq words"
