@@ -10,5 +10,4 @@
 /.venv
 /artifacts
 /wandb/
-/flashlight_custom_build
-/language_models
+/flashlight_custom_build/
