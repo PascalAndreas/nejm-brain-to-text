@@ -55,11 +55,15 @@ def load_model_and_data(model_path: str, data_dir: str, eval_type: str, device: 
     # Load model config
     model_args = OmegaConf.load(os.path.join(model_path, 'checkpoint/args.yaml'))
     
-    # Load CSV metadata
-    csv_path = os.path.join(os.path.dirname(data_dir), 't15_copyTaskData_description.csv')
+    # Load CSV metadata - it's in the data root directory
+    csv_path = os.path.join(project_root, 'data', 't15_copyTaskData_description.csv')
     if not os.path.exists(csv_path):
-        # Try alternative location
-        csv_path = os.path.join(data_dir, '..', 't15_copyTaskData_description.csv')
+        # Try alternative location relative to data_dir
+        csv_path = os.path.join(os.path.dirname(data_dir), 't15_copyTaskData_description.csv')
+        if not os.path.exists(csv_path):
+            csv_path = os.path.join(data_dir, '..', '..', 't15_copyTaskData_description.csv')
+    
+    logger.info(f"Loading CSV metadata from: {csv_path}")
     b2txt_csv_df = pd.read_csv(csv_path)
     
     # Initialize model
@@ -76,7 +80,8 @@ def load_model_and_data(model_path: str, data_dir: str, eval_type: str, device: 
     )
     
     # Load model weights
-    checkpoint = torch.load(os.path.join(model_path, 'checkpoint/best_checkpoint'), weights_only=False)
+    checkpoint = torch.load(os.path.join(model_path, 'checkpoint/best_checkpoint'), 
+                           weights_only=False, map_location=device)
     # Clean up keys (remove module. and _orig_mod. prefixes)
     state_dict = {}
     for key, value in checkpoint['model_state_dict'].items():
@@ -146,6 +151,7 @@ def get_model_logits(model, model_args, eval_data, device):
         for session, data in tqdm(eval_data.items(), desc="Sessions"):
             data['logits'] = []
             input_layer = model_args['dataset']['sessions'].index(session)
+            logger.info(f"Processing {session} with day_idx={input_layer}")
             
             for trial in tqdm(range(len(data['neural_features'])), desc=f"{session} trials", leave=False):
                 # Get neural input
@@ -160,15 +166,12 @@ def get_model_logits(model, model_args, eval_data, device):
     logger.info("Logits generation completed")
 
 
-def decode_all_trials(eval_data, decoder_config, submission_config):
-    """Decode all trials with the specified decoder configuration."""
+def decode_all_trials(eval_data, submission_config):
+    """Decode all trials using the decoder configuration from config.yaml."""
     logger = logging.getLogger(__name__)
     
-    # Initialize decoder using new architecture
-    decoder = Decoder(
-        backend=decoder_config.get('backend', 'flashlight'),
-        **{k: v for k, v in decoder_config.items() if k != 'backend'}
-    )
+    # Initialize decoder - automatically loads from decoding/config.yaml
+    decoder = Decoder()
     
     logger.info(f"Initialized {decoder.decoder_type} decoder")
     
@@ -251,8 +254,6 @@ def generate_submission(
     data_dir: str,
     output_dir: str,
     eval_type: str = 'test',
-    config_path: str = None,
-    decoder_backend: str = 'flashlight',
     device: str = 'cuda'
 ):
     """Generate submission file for test data."""
@@ -265,53 +266,22 @@ def generate_submission(
         device = torch.device('cpu')
     logger.info(f"Using device: {device}")
     
-    # Load configuration
-    if config_path and os.path.exists(config_path):
-        config = OmegaConf.load(config_path)
+    # Load submission config from decoding config
+    decoding_config_path = project_root / "decoding" / "config.yaml"
+    if decoding_config_path.exists():
+        config = OmegaConf.load(decoding_config_path)
+        submission_config = config.get('submission', {
+            'lowercase': True,
+            'strip_punct': True,
+            'collapse_space': True
+        })
     else:
-        # Try to load config from decoding module
-        decoding_config_path = project_root / "decoding" / "config.yaml"
-        if decoding_config_path.exists():
-            config = OmegaConf.load(decoding_config_path)
-        else:
-            # Fallback config
-            config = OmegaConf.create({
-                'decoding': {
-                    'backend': decoder_backend,
-                    'lm_weight': 1.0,
-                    'word_score': -0.5,
-                    'beam_size': 500,
-                    'beam_size_token': 100,
-                    'beam_threshold': 15.0,
-                    'nbest': 1,
-                    'blank_token': 'BLANK',
-                    'silence_token': 'SIL',
-                    'unk_word': '<unk>'
-                },
-                'submission': {
-                    'lowercase': True,
-                    'strip_punct': True,
-                    'collapse_space': True
-                }
-            })
+        submission_config = {
+            'lowercase': True,
+            'strip_punct': True,
+            'collapse_space': True
+        }
     
-    # Extract decoder and submission configs
-    if 'decoding' in config:
-        decoder_config = dict(config.decoding)
-    elif 'flashlight' in config:
-        # Handle old config format
-        decoder_config = dict(config.flashlight)
-        decoder_config['backend'] = 'flashlight'
-    else:
-        decoder_config = {'backend': decoder_backend}
-    
-    submission_config = config.get('submission', {
-        'lowercase': True,
-        'strip_punct': True,
-        'collapse_space': True
-    })
-    
-    logger.info(f"Decoder config: {decoder_config}")
     logger.info(f"Submission config: {submission_config}")
     
     # Load model and data
@@ -325,13 +295,13 @@ def generate_submission(
     
     # Decode all trials
     start_time = time.time()
-    submission_results = decode_all_trials(eval_data, decoder_config, submission_config)
+    submission_results = decode_all_trials(eval_data, submission_config)
     decode_time = time.time() - start_time
     logger.info(f"Decoding took {decode_time:.2f} seconds")
     
     # Create submission CSV
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_filename = f"submission_{eval_type}_{decoder_config.get('backend', 'unknown')}_{timestamp}.csv"
+    output_filename = f"submission_{eval_type}_flashlight_{timestamp}.csv"
     output_path = os.path.join(output_dir, output_filename)
     
     submission_df = create_submission_csv(submission_results, output_path, eval_type)
@@ -349,35 +319,40 @@ def generate_submission(
         'logits_time': logits_time,
         'decode_time': decode_time,
         'total_time': logits_time + decode_time,
-        'decoder_config': decoder_config,
-        'submission_config': submission_config,
+        'submission_config': dict(submission_config),  # Convert to plain dict
         'output_file': output_path
     }
     
     log_path = os.path.join(output_dir, f"submission_log_{timestamp}.yaml")
-    with open(log_path, 'w') as f:
-        yaml.dump(log_data, f, default_flow_style=False)
-    
-    logger.info(f"Processing log saved to: {log_path}")
+    try:
+        with open(log_path, 'w') as f:
+            yaml.dump(log_data, f, default_flow_style=False)
+        logger.info(f"Processing log saved to: {log_path}")
+    except Exception as e:
+        logger.warning(f"Could not save YAML log: {e}")
+        # Save as JSON instead
+        import json
+        log_path_json = log_path.replace('.yaml', '.json')
+        with open(log_path_json, 'w') as f:
+            json.dump(log_data, f, indent=2)
+        logger.info(f"Processing log saved as JSON to: {log_path_json}")
     
     return submission_df, output_path
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate submission CSV for test data")
-    parser.add_argument('--model_path', type=str, required=True,
+    parser.add_argument('--model_path', type=str, 
+                        default='data/t15_pretrained_rnn_baseline/t15_pretrained_rnn_baseline',
                         help='Path to trained model directory')
-    parser.add_argument('--data_dir', type=str, required=True,
+    parser.add_argument('--data_dir', type=str, 
+                        default='data/t15_copyTask_neuralData/hdf5_data_final',
                         help='Path to data directory')
     parser.add_argument('--output_dir', type=str, default='submission_output',
                         help='Output directory for submission files')
     parser.add_argument('--eval_type', type=str, default='test', choices=['val', 'test'],
                         help='Evaluation type: val or test')
-    parser.add_argument('--config_path', type=str, default=None,
-                        help='Path to config file with decoding parameters')
-    parser.add_argument('--decoder_backend', type=str, default='flashlight',
-                        choices=['greedy', 'flashlight'], help='Decoder backend to use')
-    parser.add_argument('--device', type=str, default='cuda',
+    parser.add_argument('--device', type=str, default='cpu',
                         choices=['cuda', 'cpu'], help='Device to use')
     
     args = parser.parse_args()
@@ -388,8 +363,6 @@ if __name__ == "__main__":
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         eval_type=args.eval_type,
-        config_path=args.config_path,
-        decoder_backend=args.decoder_backend,
         device=args.device
     )
     

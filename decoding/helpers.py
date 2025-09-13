@@ -3,8 +3,10 @@ Shared helper functions for CTC decoders.
 Contains common functionality used across different decoder implementations.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
+import csv
+import os
 
 
 def load_tokens(tokens_path: str) -> List[str]:
@@ -18,26 +20,56 @@ def load_tokens(tokens_path: str) -> List[str]:
     return tokens
 
 
-def load_lexicon_dict(lexicon_path: str) -> Dict[str, List[str]]:
-    """Load lexicon and create phoneme-to-word mapping."""
-    lexicon_dict = defaultdict(list)
+def load_lexicon_with_probs(lexicon_path: str, verbose: Optional[bool] = False) -> Dict[str, Tuple[List[str], float]]:
+    """
+    Load lexicon with 1-gram log probabilities from CSV format.
+    Returns dict mapping phoneme sequences to (word_list, log_prob) tuples.
+    """
+    lexicon_dict = {}
+    
     try:
         with open(lexicon_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    word = parts[0]
-                    phonemes = ' '.join(parts[1:])
-                    # Collect all possible words for this phoneme sequence
-                    lexicon_dict[phonemes].append(word)
+            reader = csv.reader(f)
+            next(reader)  # Skip header
+            
+            phoneme_to_entries = defaultdict(list)
+            for row in reader:
+                if len(row) >= 3:
+                    word = row[0]
+                    phonemes = row[1]
+                    log_prob = float(row[2])
+                    phoneme_to_entries[phonemes].append((word, log_prob))
+            
+            # For each phoneme sequence, collect words and use the best log prob
+            for phonemes, entries in phoneme_to_entries.items():
+                words = [entry[0] for entry in entries]
+                # Use the highest log probability among all words for this phoneme sequence
+                best_log_prob = max(entry[1] for entry in entries)
+                lexicon_dict[phonemes] = (words, best_log_prob)
         
-        # Convert to regular dict with lists
-        lexicon_dict = dict(lexicon_dict)
-        total_entries = sum(len(words) for words in lexicon_dict.values())
-        print(f"Loaded {len(lexicon_dict)} unique pronunciations with {total_entries} word entries")
+        total_entries = sum(len(words) for words, _ in lexicon_dict.values())
+        if verbose:
+            print(f"Loaded {len(lexicon_dict)} unique pronunciations with {total_entries} word entries")
+        
     except Exception as e:
         print(f"Warning: Could not load lexicon: {e}")
         lexicon_dict = {}
+    
+    return lexicon_dict
+
+
+def load_lexicon_dict(lexicon_path: str) -> Dict[str, List[str]]:
+    """
+    Load lexicon and create phoneme-to-word mapping (backward compatible).
+    This function maintains the original interface for compatibility with greedy.py.
+    """
+    lexicon_with_probs = load_lexicon_with_probs(lexicon_path)
+    
+    # Convert to old format (drop probabilities)
+    lexicon_dict = {}
+    for phonemes, (words, _) in lexicon_with_probs.items():
+        lexicon_dict[phonemes] = words
+    
     return lexicon_dict
 
 

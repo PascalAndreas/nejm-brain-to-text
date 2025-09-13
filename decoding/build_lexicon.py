@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Set, Dict, List, Tuple
 from collections import defaultdict
 import urllib.request
+import csv
 
 # Suppress G2P numpy warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="g2p_en")
@@ -18,6 +19,13 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="g2p_en")
 from g2p_en import G2p
 
 from decoding.helpers import LOGIT_TO_PHONEME, PHONE_MAPPING
+
+try:
+    import kenlm
+    KENLM_AVAILABLE = True
+except ImportError:
+    KENLM_AVAILABLE = False
+    print("Warning: kenlm not available. 1-gram probabilities will not be computed.")
 
 
 def download_cmudict(cache_path: str = "artifacts/cmudict.dict") -> str:
@@ -85,6 +93,41 @@ def map_phones_to_logit_set(phones: List[str]) -> List[str]:
     return mapped_phones
 
 
+def load_kenlm_model(lm_path: str):
+    """Load KenLM model for computing 1-gram probabilities."""
+    if not KENLM_AVAILABLE:
+        print("Warning: KenLM not available, cannot compute 1-gram probabilities")
+        return None
+    
+    if not lm_path or not os.path.exists(lm_path):
+        print(f"Warning: Language model not found at {lm_path}")
+        return None
+    
+    try:
+        print(f"Loading KenLM model from: {lm_path}")
+        model = kenlm.Model(lm_path)
+        print(f"Successfully loaded KenLM model (order: {model.order})")
+        return model
+    except Exception as e:
+        print(f"Failed to load KenLM model: {e}")
+        return None
+
+
+def get_word_1gram_logprob(model, word: str) -> float:
+    """Get 1-gram log probability for a word from KenLM model."""
+    if model is None:
+        return 0.0  # Default score if no model
+    
+    try:
+        # Query 1-gram probability (no context)
+        # Use bos=False, eos=False to get just the word probability
+        log_prob = model.score(word.lower(), bos=False, eos=False)
+        return log_prob
+    except Exception as e:
+        print(f"Warning: Failed to get log probability for word '{word}': {e}")
+        return 0.0  # Default score on failure
+
+
 def extract_lm_vocabulary_from_lexicon(lexicon_file_path: str, top_n: int = 50000) -> List[str]:
     """
     Extract top-N vocabulary from NVIDIA TAO lexicon file (already frequency-ordered).
@@ -124,21 +167,28 @@ def build_lexicon(
     output_path: str,
     vocab_boost_size: int = 50000,
     cmudict_path: str = None,
-    lm_vocab_file: str = None
+    lm_vocab_file: str = None,
+    lm_path: str = None
 ) -> Tuple[int, int, float]:
     """
     Build lexicon.txt file from CMUdict + G2P fallback using LM vocabulary.
     
     Args:
-        output_path: Path to write lexicon.txt
+        output_path: Path to write lexicon.txt (or lexicon.csv if including probabilities)
         vocab_boost_size: Number of high-frequency words to add from LM vocab
         cmudict_path: Path to CMUdict file (will download if None)
         lm_vocab_file: Path to LM vocabulary file (e.g., NVIDIA TAO vocab)
+        lm_path: Path to KenLM model for computing 1-gram probabilities
         
     Returns:
         Tuple of (total_words, total_pronunciations, oov_rate)
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Load KenLM model for 1-gram probabilities (required for CSV format)
+    kenlm_model = load_kenlm_model(lm_path) if lm_path else None
+    if not kenlm_model:
+        raise ValueError("KenLM model is required for lexicon building. Please provide lm_path.")
     
     # Download/load CMUdict
     if cmudict_path is None:
@@ -157,8 +207,8 @@ def build_lexicon(
     # Initialize G2P for OOV words
     g2p = G2p()
     
-    # Build lexicon
-    lexicon = {}
+    # Build lexicon with 1-gram probabilities
+    lexicon = {}  # word -> (pronunciations, log_prob)
     oov_count = 0
     total_words = 0
     words_added = 0
@@ -199,22 +249,33 @@ def build_lexicon(
                 continue
         
         if pronunciations:
-            lexicon[word_clean] = pronunciations
+            # Get 1-gram log probability
+            log_prob = get_word_1gram_logprob(kenlm_model, word_clean)
+            lexicon[word_clean] = (pronunciations, log_prob)
             words_added += 1
     
     print(f"Successfully added {words_added} words to lexicon")
     
-    # Write lexicon file - words in frequency order from TAO lexicon
+    # Sort words by 1-gram log probability (highest first)
+    sorted_words = sorted(lexicon.keys(), 
+                        key=lambda w: lexicon[w][1], reverse=True)
+    print(f"Sorted {len(sorted_words)} words by 1-gram log probability")
+    
+    # Write CSV lexicon file with log probabilities
     total_pronunciations = 0
-    with open(output_path, 'w') as f:
-        # Write words in frequency order from TAO lexicon
-        for word in vocab_list:
-            word_clean = word.upper().strip()
-            if word_clean in lexicon:
-                pronunciations = lexicon[word_clean]
-                for pron in pronunciations:
-                    f.write(f"{word_clean.lower()} {' '.join(pron)}\n")
-                    total_pronunciations += 1
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['word', 'phonemes', 'log_prob'])  # Header
+        
+        for word in sorted_words:
+            pronunciations, log_prob = lexicon[word]
+            for pron in pronunciations:
+                writer.writerow([word.lower(), ' '.join(pron), log_prob])
+                total_pronunciations += 1
+        
+        # Add <unk> token at the end with a low probability
+        writer.writerow(['<unk>', 'AH N K', -10.0])
+        total_pronunciations += 1
     
     # Calculate statistics
     oov_rate = oov_count / total_words if total_words > 0 else 0
@@ -227,10 +288,11 @@ def build_lexicon(
     # Validate that all phones are in LOGIT_TO_PHONEME
     all_phones_in_lexicon = set()
     with open(output_path, 'r') as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) > 1:
-                phones = parts[1:]
+        reader = csv.reader(f)
+        next(reader)  # Skip header
+        for row in reader:
+            if len(row) >= 2:
+                phones = row[1].split()
                 all_phones_in_lexicon.update(phones)
     
     invalid_phones = all_phones_in_lexicon - set(LOGIT_TO_PHONEME[1:40])  # Exclude BLANK (0) and 'SIL' (40)
@@ -253,15 +315,21 @@ if __name__ == "__main__":
         
         vocab_size = config.get('lexicon', {}).get('lm_vocab_size', 50000)
         lm_vocab_file = config.get('language_model', {}).get('nvidia_tao', {}).get('lexicon_file')
+        lm_path = config.get('language_model', {}).get('active_model')
         output_path = config.get('artifacts', {}).get('lexicon_txt')
+        
+        # Always use CSV format
+        output_path = output_path.replace('.txt', '.csv')
     else:
         vocab_size = 50000
         lm_vocab_file = None
-        output_path = 'artifacts/lexicon.txt'
+        lm_path = None
+        output_path = 'artifacts/lexicon.csv'
     
     # Build lexicon with configuration settings
     build_lexicon(
         output_path, 
         vocab_boost_size=vocab_size,
-        lm_vocab_file=lm_vocab_file
+        lm_vocab_file=lm_vocab_file,
+        lm_path=lm_path
     )

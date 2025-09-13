@@ -12,3 +12,5 @@
 /wandb/
 /flashlight_custom_build/
 /.cursor
+/grid_search_results/
+/submission_output/

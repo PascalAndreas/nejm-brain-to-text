@@ -12,18 +12,17 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 # Handle relative imports for both package and direct execution
-from decoding.helpers import load_tokens, load_lexicon_dict
-
+from decoding.helpers import load_tokens, load_lexicon_dict, load_lexicon_with_probs
 try:
     from flashlight.lib.text.decoder import (
         LexiconDecoder, LexiconDecoderOptions, SmearingMode, CriterionType,
-        Trie, ZeroLM, LM
+        Trie, ZeroLM, KenLM
     )
     from flashlight.lib.text.dictionary import Dictionary, create_word_dict, load_words
     FLASHLIGHT_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     FLASHLIGHT_AVAILABLE = False
-    print("Warning: flashlight-text not available")
+    print(f"Warning: flashlight-text not available: {e}")
 
 
 
@@ -48,7 +47,11 @@ class FlashlightCTCDecoder:
         blank_token: Optional[str] = None,
         silence_token: Optional[str] = None,
         unk_word: Optional[str] = None,
-        device: Optional[torch.device] = None
+        sil_score: Optional[float] = None,
+        log_add: Optional[bool] = None,
+        smearing_mode: Optional[str] = None,
+        device: Optional[torch.device] = None,
+        verbose: Optional[bool] = False
     ):
         """
         Initialize Flashlight CTC decoder.
@@ -72,26 +75,29 @@ class FlashlightCTCDecoder:
             raise ImportError("Flashlight is not available. Please install flashlight-text.")
         
         # Initialize in deterministic, testable steps
+        self.verbose = verbose
         self._load_config(tokens_path, lexicon_path, lm_path, lm_weight, word_score,
                          beam_size, beam_size_token, beam_threshold, nbest,
-                         blank_token, silence_token, unk_word, device)
+                         blank_token, silence_token, unk_word, sil_score, log_add, 
+                         smearing_mode, device)
         self._load_tokens()
         self._load_lexicon()
         self._load_or_zero_lm()
         self._build_trie()
         self._build_decoder()
-        
-        print(f"Initialized FlashlightCTCDecoder:")
-        print(f"  Tokens: {len(self.tokens)} ({self.tokens_path})")
-        print(f"  Lexicon: {self.lexicon_path}")
-        print(f"  LM: {self.lm_path}")
-        print(f"  Blank token: '{self.blank_token}' (idx={self.blank_idx})")
-        print(f"  Silence token: '{self.silence_token}' (idx={self.silence_idx})")
-        print(f"  Beam size: {self.beam_size}, LM weight: {self.lm_weight}, Word score: {self.word_score}")
+        if verbose:
+            print(f"Initialized FlashlightCTCDecoder:")
+            print(f"  Tokens: {len(self.tokens)} ({self.tokens_path})")
+            print(f"  Lexicon: {self.lexicon_path}")
+            print(f"  LM: {self.lm_path}")
+            print(f"  Blank token: '{self.blank_token}' (idx={self.blank_idx})")
+            print(f"  Silence token: '{self.silence_token}' (idx={self.silence_idx})")
+            print(f"  Beam size: {self.beam_size}, LM weight: {self.lm_weight}, Word score: {self.word_score}")
     
     def _load_config(self, tokens_path, lexicon_path, lm_path, lm_weight, word_score,
                      beam_size, beam_size_token, beam_threshold, nbest,
-                     blank_token, silence_token, unk_word, device):
+                     blank_token, silence_token, unk_word, sil_score, log_add, 
+                     smearing_mode, device):
         """Load configuration and set parameters."""
         # Load configuration
         config_path = Path(__file__).parent / "config.yaml"
@@ -109,6 +115,9 @@ class FlashlightCTCDecoder:
         self.beam_size_token = beam_size_token if beam_size_token is not None else config.flashlight.beam_size_token
         self.beam_threshold = beam_threshold if beam_threshold is not None else config.flashlight.beam_threshold
         self.nbest = int(nbest) if nbest is not None else int(config.flashlight.nbest)
+        self.sil_score = sil_score if sil_score is not None else config.flashlight.get('sil_score', -1.0)
+        self.log_add = log_add if log_add is not None else config.flashlight.get('log_add', False)
+        self.smearing_mode = smearing_mode if smearing_mode is not None else config.flashlight.get('smearing_mode', 'max')
         
         # Token definitions from decoder section
         self.blank_token = blank_token or config.decoder.blank_token
@@ -135,26 +144,40 @@ class FlashlightCTCDecoder:
             self.silence_idx = -1
     
     def _load_lexicon(self):
-        """Load lexicon."""
-        self.lexicon_dict = load_lexicon_dict(self.lexicon_path)
+        """Load lexicon with probabilities for both trie building and word dictionary."""
+        self.lexicon_dict = load_lexicon_with_probs(self.lexicon_path, verbose=self.verbose)
+        
+        # Create word-to-logprob mapping for fast trie construction
+        self.word_to_logprob = {}
+        for phonemes, (words, log_prob) in self.lexicon_dict.items():
+            for word in words:
+                # Use the highest log prob if word appears multiple times
+                if word not in self.word_to_logprob or log_prob > self.word_to_logprob[word]:
+                    self.word_to_logprob[word] = log_prob
     
     def _load_or_zero_lm(self):
         """Load language model or create ZeroLM fallback. Build word dictionary."""
-        # Load lexicon for word dictionary
-        lexicon = load_words(self.lexicon_path)
-        self.word_dict = create_word_dict(lexicon)
+        # Convert lexicon_dict to format expected by flashlight
+        flashlight_lexicon = {}
+        for phonemes, (words, _) in self.lexicon_dict.items():
+            for word in words:
+                if word not in flashlight_lexicon:
+                    flashlight_lexicon[word] = []
+                flashlight_lexicon[word].append(phonemes.split())
         
-        # Explicitly add <unk> if we intend to allow it
-        if self.unk_word and self.unk_word not in [word for word in lexicon.keys()]:
-            self.word_dict.add_entry(self.unk_word)
+        self.word_dict = create_word_dict(flashlight_lexicon)
+        
+        # <unk> should already be in the lexicon at the end, no need to add explicitly
         
         # Try to load actual language model
         if self.lm_path and os.path.exists(self.lm_path):
             try:
                 from flashlight.lib.text.decoder import KenLM
-                print(f"Loading KenLM from: {self.lm_path}")
+                if self.verbose:
+                    print(f"Loading KenLM from: {self.lm_path}")
                 self.lm = KenLM(self.lm_path, self.word_dict)
-                print("Successfully loaded KenLM language model")
+                if self.verbose:
+                    print("Successfully loaded KenLM language model")
             except Exception as e:
                 print(f"Failed to load KenLM: {e}")
                 print("Falling back to ZeroLM")
@@ -164,25 +187,33 @@ class FlashlightCTCDecoder:
             self.lm = ZeroLM()
     
     def _build_trie(self):
-        """Build trie from lexicon with LM word priors."""
+        """Build trie from lexicon with 1-gram log probabilities as word scores."""
         # Load tokens dictionary
         self.token_dict = Dictionary()
         for token in self.tokens:
             self.token_dict.add_entry(token)
         
-        # Load lexicon
-        lexicon = load_words(self.lexicon_path)
+        # Convert lexicon_dict to format expected by trie building
+        flashlight_lexicon = {}
+        for phonemes, (words, _) in self.lexicon_dict.items():
+            for word in words:
+                if word not in flashlight_lexicon:
+                    flashlight_lexicon[word] = []
+                flashlight_lexicon[word].append(phonemes.split())
         
         # Build trie from lexicon
         self.trie = Trie(self.token_dict.index_size(), self.word_dict.index_size())
         
         trie_insertions = 0
         failed_insertions = 0
-        for word, spellings in lexicon.items():
+        for word, spellings in flashlight_lexicon.items():
             word_idx = self.word_dict.get_index(word)
             if word_idx == -1:
                 failed_insertions += 1
                 continue
+            
+            # Get 1-gram log probability for this word using fast lookup
+            word_log_prob = self.word_to_logprob.get(word, 0.0)
                 
             for spelling in spellings:
                 # Convert spelling (list of tokens) to token indices
@@ -195,14 +226,21 @@ class FlashlightCTCDecoder:
                         print(f"DEBUG: Unknown token '{token}' in word '{word}' spelling {spelling}")
                 
                 if spelling_indices:  # Only add if we have valid tokens
-                    # For now, use 0.0 as word score (LM integration will come later)
-                    self.trie.insert(spelling_indices, word_idx, 0.0)
+                    # Use 1-gram log probability as word score
+                    self.trie.insert(spelling_indices, word_idx, word_log_prob)
                     trie_insertions += 1
         
         # Apply trie smearing for better lexicon lookahead
-        self.trie.smear(SmearingMode.MAX)
-        
-        print(f"Built trie with {trie_insertions} insertions, {failed_insertions} failed")
+        smearing_mode_map = {
+            'max': SmearingMode.MAX,
+            'logadd': SmearingMode.LOGADD,
+            'none': SmearingMode.NONE
+        }
+        smearing_mode = smearing_mode_map.get(self.smearing_mode.lower(), SmearingMode.MAX)
+        self.trie.smear(smearing_mode)
+        if self.verbose:
+            print(f"Built trie with {trie_insertions} insertions, {failed_insertions} failed")
+            print(f"Using 1-gram log probabilities as word scores")
     
     def _build_decoder(self):
         """Build the final Flashlight decoder with all components."""
@@ -214,8 +252,8 @@ class FlashlightCTCDecoder:
             lm_weight=self.lm_weight,
             word_score=self.word_score,
             unk_score=-float('inf'),
-            sil_score=-1.0,  # Changed to penalty as requested
-            log_add=False,
+            sil_score=self.sil_score,
+            log_add=self.log_add,
             criterion_type=CriterionType.CTC
         )
         
@@ -239,8 +277,8 @@ class FlashlightCTCDecoder:
         
         if self.decoder is None:
             raise RuntimeError("Failed to build Flashlight decoder")
-        
-        print("Built Flashlight CTC decoder with lexicon")
+        if self.verbose:
+            print("Built Flashlight CTC decoder with lexicon")
     
     
     def decode(
@@ -319,7 +357,6 @@ class FlashlightCTCDecoder:
                     # Get n-best if available
                     nbest_results = []
                     nbest = int(self.nbest) if self.nbest is not None else 1
-                    print(f"Processing {len(decoder_results)} decoder results, requesting {nbest} n-best")
                     for j, result in enumerate(decoder_results[:nbest]):
                         result_words = []
                         result_tokens = []
@@ -349,8 +386,6 @@ class FlashlightCTCDecoder:
                             'rank': j,
                             'sentence': ' '.join(result_words)
                         })
-                    
-                    print(f"Generated {len(nbest_results)} n-best results after processing")
                     
                     results.append({
                         'words': words,

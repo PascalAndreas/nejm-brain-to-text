@@ -28,11 +28,12 @@ def create_decoder(decoder_type: str, **kwargs) -> Any:
     
     if decoder_type == 'flashlight':
         try:
-            from .flashlight import FlashlightCTCDecoder
+            from .flashlight_ctc import FlashlightCTCDecoder
             return FlashlightCTCDecoder(**kwargs)
         except ImportError as e:
             if "flashlight" in str(e).lower():
                 print("Flashlight not available, falling back to greedy decoder")
+                print(e)
                 from .greedy import GreedyCTCDecoder
                 return GreedyCTCDecoder(**kwargs)
             else:
@@ -113,6 +114,9 @@ class Decoder:
                     'beam_size_token': self.config.flashlight.get('beam_size_token'),
                     'beam_threshold': self.config.flashlight.get('beam_threshold'),
                     'nbest': self.config.flashlight.get('nbest'),
+                    'sil_score': self.config.flashlight.get('sil_score'),
+                    'log_add': self.config.flashlight.get('log_add'),
+                    'smearing_mode': self.config.flashlight.get('smearing_mode'),
                 })
             else:
                 # Fallback to decoder section for backward compatibility

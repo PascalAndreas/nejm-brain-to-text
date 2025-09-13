@@ -17,7 +17,7 @@ from .build_tokens import build_tokens
 from .build_lexicon import build_lexicon, extract_lm_vocabulary_from_lexicon
 from .filter_lm import filter_language_model
 from .decoder import Decoder, create_decoder
-from .flashlight import FlashlightCTCDecoder
+from .flashlight_ctc import FlashlightCTCDecoder
 from .greedy import GreedyCTCDecoder
 from . import helpers
 
