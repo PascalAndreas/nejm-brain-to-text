@@ -28,7 +28,7 @@ except ImportError:
     print("Warning: kenlm not available. 1-gram probabilities will not be computed.")
 
 
-def download_cmudict(cache_path: str = "artifacts/cmudict.dict") -> str:
+def download_cmudict(cache_path: str = "decoding/artifacts/cmudict.dict") -> str:
     """Download CMUdict if not already cached."""
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     
@@ -192,7 +192,10 @@ def build_lexicon(
     
     # Download/load CMUdict
     if cmudict_path is None:
-        cmudict_path = download_cmudict()
+        # Use absolute path for cmudict
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        cmudict_path = os.path.join(project_root, "decoding/artifacts/cmudict.dict")
+        cmudict_path = download_cmudict(cmudict_path)
     cmudict = load_cmudict(cmudict_path)
     
     # Get vocabulary from NVIDIA TAO lexicon (frequency-ordered)
@@ -309,6 +312,8 @@ if __name__ == "__main__":
     
     # Load configuration
     config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    project_root = os.path.dirname(os.path.dirname(__file__))  # Go up one level from /decoding
+    
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
@@ -318,13 +323,22 @@ if __name__ == "__main__":
         lm_path = config.get('language_model', {}).get('active_model')
         output_path = config.get('artifacts', {}).get('lexicon_txt')
         
+        # Resolve paths relative to project root
+        if lm_vocab_file and not os.path.isabs(lm_vocab_file):
+            lm_vocab_file = os.path.join(project_root, lm_vocab_file)
+        if lm_path and not os.path.isabs(lm_path):
+            lm_path = os.path.join(project_root, lm_path)
+        if output_path and not os.path.isabs(output_path):
+            output_path = os.path.join(project_root, output_path)
+        
         # Always use CSV format
-        output_path = output_path.replace('.txt', '.csv')
+        if output_path:
+            output_path = output_path.replace('.txt', '.csv')
     else:
         vocab_size = 50000
         lm_vocab_file = None
         lm_path = None
-        output_path = 'artifacts/lexicon.csv'
+        output_path = os.path.join(project_root, 'decoding/artifacts/lexicon.csv')
     
     # Build lexicon with configuration settings
     build_lexicon(

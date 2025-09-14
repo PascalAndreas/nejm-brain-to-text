@@ -251,9 +251,9 @@ def generate_submission(
             # Fallback config
             config = OmegaConf.create({
                 'decoding': {
-                    'tokens_txt': 'artifacts/tokens.txt',
-                    'lexicon_txt': 'artifacts/lexicon.txt',
-                    'kenlm_path': 'artifacts/simple_3gram.arpa',
+                    'tokens_txt': 'decoding/artifacts/tokens.txt',
+                    'lexicon_txt': 'decoding/artifacts/lexicon.csv',
+                    'kenlm_path': 'decoding/artifacts/simple_3gram.arpa',
                     'lm_weight': 0.35,
                     'word_score': -90.0,
                     'beam_size': 17,

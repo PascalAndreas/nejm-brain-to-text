@@ -10,15 +10,30 @@ from typing import Set
 
 
 def load_lexicon_vocabulary(lexicon_path: str) -> Set[str]:
-    """Load vocabulary from lexicon.txt file."""
+    """Load vocabulary from lexicon file (supports both .txt and .csv formats)."""
     vocab = set()
     
+    # Check if it's CSV format (has header and commas)
     with open(lexicon_path, 'r') as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 1:
-                word = parts[0].lower()
-                vocab.add(word)
+        first_line = f.readline().strip()
+        f.seek(0)  # Reset to beginning
+        
+        if first_line.startswith('word,phonemes') or ',' in first_line:
+            # CSV format
+            import csv
+            reader = csv.reader(f)
+            next(reader)  # Skip header
+            for row in reader:
+                if len(row) >= 1:
+                    word = row[0].lower()
+                    vocab.add(word)
+        else:
+            # TXT format (legacy)
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 1:
+                    word = parts[0].lower()
+                    vocab.add(word)
     
     print(f"Loaded {len(vocab)} words from lexicon")
     return vocab

@@ -3,25 +3,25 @@
 
 # Model artifacts paths
 artifacts:
-  tokens_txt: artifacts/tokens.txt
-  lexicon_txt: artifacts/lexicon.csv
+  tokens_txt: decoding/artifacts/tokens.txt
+  lexicon_txt: decoding/artifacts/lexicon.csv
   
 # Language model configuration  
 language_model:
   # NVIDIA TAO speech-to-text models (recommended)
   nvidia_tao:
-    model_dir: models/language_models/nvidia_tao_v4.1
+    model_dir: language_models
     # Available models in the TAO package:
-    arpa_4gram: models/language_models/nvidia_tao_v4.1/4gram-pruned-0_2_7_9-en-lm-set-1.0.arpa
-    binary_4gram: models/language_models/nvidia_tao_v4.1/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
-    arpa_mixed: models/language_models/nvidia_tao_v4.1/mixed_lm-lower.arpa  # Large 5-gram
-    binary_mixed: models/language_models/nvidia_tao_v4.1/mixed-lower.binary
-    arpa_3gram: models/language_models/nvidia_tao_v4.1/3-gram.pruned.3e-7.arpa
-    vocab_file: models/language_models/nvidia_tao_v4.1/en_4.0_dict_vocab.txt
-    lexicon_file: models/language_models/nvidia_tao_v4.1/lexicon.txt  # Pre-built lexicon
+    arpa_4gram: language_models/4gram-pruned-0_2_7_9-en-lm-set-1.0.arpa
+    binary_4gram: language_models/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
+    arpa_mixed: language_models/mixed_lm-lower.arpa  # Large 5-gram
+    binary_mixed: language_models/mixed-lower.binary
+    arpa_3gram: language_models/3-gram.pruned.3e-7.arpa
+    vocab_file: language_models/en_4.0_dict_vocab.txt
+    lexicon_file: language_models/lexicon.txt  # Pre-built lexicon
   
   # Currently active model (change this to switch models)
-  active_model: models/language_models/nvidia_tao_v4.1/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
+  active_model: language_models/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
 
 # CTC Decoder configuration
 decoder:

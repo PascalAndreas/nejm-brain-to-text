@@ -46,6 +46,7 @@ def build_tokens(output_path: str) -> None:
 
 
 if __name__ == "__main__":
-    # Default output path
-    output_path = "artifacts/tokens.txt"
+    # Resolve path relative to project root
+    project_root = os.path.dirname(os.path.dirname(__file__))  # Go up one level from /decoding
+    output_path = os.path.join(project_root, "decoding/artifacts/tokens.txt")
     build_tokens(output_path)
