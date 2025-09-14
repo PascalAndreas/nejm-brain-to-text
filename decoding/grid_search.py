@@ -117,34 +117,31 @@ class GridSearchRunner:
         
         print(f"Found {len(dataset)} total validation trials")
         
-        # Create DataLoader with shuffling to get random samples
-        dataloader = DataLoader(
-            dataset,
-            batch_size=min(self.num_samples, len(dataset)),
-            shuffle=True,
-            collate_fn=collate_fn,
-            num_workers=0
-        )
+        # Get individual samples without padding (fix for performance degradation)
+        # Shuffle indices for random sampling
+        import random
+        indices = list(range(len(dataset)))
+        random.shuffle(indices)
         
-        # Get one batch of samples
-        batch = next(iter(dataloader))
-        
-        # Convert batch format to the format expected by the rest of the code
         samples = []
-        for i in range(len(batch['sessions'])):
-            # Extract ground truth text
-            gt_text = self._extract_ground_truth_text(
-                batch['transcriptions'][i], 
-                batch['sentence_labels'][i]
-            )
+        for idx in indices[:self.num_samples]:
+            trial = dataset[idx]
+            
+            # Extract ground truth text if available
+            gt_text = None
+            if 'sentence_label' in trial:
+                gt_text = self._extract_ground_truth_text(
+                    trial.get('transcription', torch.tensor([])), 
+                    trial['sentence_label']
+                )
             
             if gt_text:  # Only include trials with valid ground truth
                 samples.append({
-                    'neural_features': batch['input_features'][i].numpy(),
+                    'neural_features': trial['input_features'].numpy(),
                     'gt_text': gt_text,
-                    'day_idx': batch['day_indices'][i].item(),
-                    'session_name': batch['sessions'][i],
-                    'trial_key': f"trial_{batch['trial_nums'][i]:04d}"
+                    'day_idx': trial['day_index'],
+                    'session_name': trial['session'],
+                    'trial_key': f"trial_{trial['trial_num']:04d}"
                 })
         
         # Report the distribution

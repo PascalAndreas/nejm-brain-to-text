@@ -178,16 +178,12 @@ class BrainToTextDataset(Dataset):
             
             # Extract all the data
             input_features = torch.from_numpy(trial_data['input_features'][:])
-            seq_class_ids = torch.from_numpy(trial_data['seq_class_ids'][:])
-            transcription = torch.from_numpy(trial_data['transcription'][:])
             
             # Get attributes
             n_time_steps = trial_data.attrs['n_time_steps']
-            seq_len = trial_data.attrs['seq_len']
             block_num = trial_data.attrs['block_num']
             trial_num = trial_data.attrs['trial_num']
             session = trial_data.attrs['session']
-            sentence_label = trial_data.attrs.get('sentence_label', '')
             
             # Get corpus type - first check if it's in the HDF5 file, otherwise use CSV mapping
             corpus = trial_data.attrs.get('corpus', None)
@@ -195,27 +191,37 @@ class BrainToTextDataset(Dataset):
                 corpus = self._get_corpus_for_trial(session, block_num)
             
             # Map session to day index (for compatibility with day-specific layers)
-            # Use the same session order as the RNN model for consistency
             day_index = self._get_day_index_for_session(session)
             
-            return {
+            # Build return dictionary with required fields
+            result = {
                 'input_features': input_features,
-                'seq_class_ids': seq_class_ids,
-                'transcription': transcription,
                 'n_time_steps': n_time_steps,
-                'phone_seq_len': seq_len,
                 'day_index': day_index,
                 'block_num': block_num,
                 'trial_num': trial_num,
                 'session': session,
                 'corpus': corpus if corpus else 'Unknown',
-                'sentence_label': sentence_label
             }
+            
+            # Add optional fields only if they exist (not for test data)
+            if 'seq_class_ids' in trial_data:
+                result['seq_class_ids'] = torch.from_numpy(trial_data['seq_class_ids'][:])
+                result['phone_seq_len'] = trial_data.attrs.get('seq_len', 0)
+            
+            if 'transcription' in trial_data:
+                result['transcription'] = torch.from_numpy(trial_data['transcription'][:])
+            
+            if 'sentence_label' in trial_data.attrs:
+                result['sentence_label'] = trial_data.attrs['sentence_label']
+            
+            return result
 
 
 def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
     Custom collate function to handle batching of variable-length sequences.
+    Handles optional fields that may not be present in test data.
     
     Args:
         batch: List of dictionaries from __getitem__
@@ -223,33 +229,50 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     Returns:
         Batched dictionary with padded sequences
     """
-    # Separate out the different fields
+    # Initialize collated dict with required fields
     collated = {
         'input_features': [],
-        'seq_class_ids': [],
-        'transcriptions': [],
         'n_time_steps': [],
-        'phone_seq_lens': [],
         'day_indices': [],
         'block_nums': [],
         'trial_nums': [],
         'sessions': [],
-        'corpora': [],
-        'sentence_labels': []
+        'corpora': []
     }
     
+    # Check which optional fields are present
+    has_seq_class_ids = 'seq_class_ids' in batch[0]
+    has_transcription = 'transcription' in batch[0]
+    has_sentence_label = 'sentence_label' in batch[0]
+    has_phone_seq_len = 'phone_seq_len' in batch[0]
+    
+    if has_seq_class_ids:
+        collated['seq_class_ids'] = []
+    if has_transcription:
+        collated['transcriptions'] = []
+    if has_sentence_label:
+        collated['sentence_labels'] = []
+    if has_phone_seq_len:
+        collated['phone_seq_lens'] = []
+    
+    # Collect data from batch
     for item in batch:
         collated['input_features'].append(item['input_features'])
-        collated['seq_class_ids'].append(item['seq_class_ids'])
-        collated['transcriptions'].append(item['transcription'])
         collated['n_time_steps'].append(item['n_time_steps'])
-        collated['phone_seq_lens'].append(item['phone_seq_len'])
         collated['day_indices'].append(item['day_index'])
         collated['block_nums'].append(item['block_num'])
         collated['trial_nums'].append(item['trial_num'])
         collated['sessions'].append(item['session'])
         collated['corpora'].append(item['corpus'])
-        collated['sentence_labels'].append(item['sentence_label'])
+        
+        if has_seq_class_ids:
+            collated['seq_class_ids'].append(item['seq_class_ids'])
+        if has_transcription:
+            collated['transcriptions'].append(item['transcription'])
+        if has_sentence_label:
+            collated['sentence_labels'].append(item['sentence_label'])
+        if has_phone_seq_len:
+            collated['phone_seq_lens'].append(item['phone_seq_len'])
     
     # Pad sequences
     collated['input_features'] = pad_sequence(
@@ -257,21 +280,24 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         batch_first=True, 
         padding_value=0
     )
-    collated['seq_class_ids'] = pad_sequence(
-        collated['seq_class_ids'], 
-        batch_first=True, 
-        padding_value=0
-    )
     
-    # Convert lists to tensors where appropriate
+    if has_seq_class_ids:
+        collated['seq_class_ids'] = pad_sequence(
+            collated['seq_class_ids'], 
+            batch_first=True, 
+            padding_value=0
+        )
+    
+    if has_transcription:
+        collated['transcriptions'] = torch.stack(collated['transcriptions'])
+    
+    # Convert to tensors
     collated['n_time_steps'] = torch.tensor(collated['n_time_steps'])
-    collated['phone_seq_lens'] = torch.tensor(collated['phone_seq_lens'])
     collated['day_indices'] = torch.tensor(collated['day_indices'])
     collated['block_nums'] = torch.tensor(collated['block_nums'])
     collated['trial_nums'] = torch.tensor(collated['trial_nums'])
-    collated['transcriptions'] = torch.stack(collated['transcriptions'])
     
-    # Keep string lists as is
-    # collated['sessions'], collated['corpora'], collated['sentence_labels'] remain as lists
+    if has_phone_seq_len:
+        collated['phone_seq_lens'] = torch.tensor(collated['phone_seq_lens'])
     
     return collated

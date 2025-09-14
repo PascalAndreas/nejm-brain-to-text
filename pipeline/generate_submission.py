@@ -21,10 +21,12 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from model_training.rnn_model import GRUDecoder
-from model_training.evaluate_model_helpers import load_h5py_file
 from model_training.data_augmentations import gauss_smooth
 from decoding.decoder import Decoder
+from dataset import BrainToTextDataset, collate_fn
+from torch.utils.data import DataLoader
 from nejm_b2txt_utils.general_utils import remove_punctuation
+from jiwer import wer, cer
 
 try:
     import wandb
@@ -49,22 +51,11 @@ def setup_logging(output_dir: str):
 
 
 def load_model_and_data(model_path: str, data_dir: str, eval_type: str, device: torch.device):
-    """Load the trained model and test/validation data."""
+    """Load the trained model and test/validation data using the new dataset class."""
     logger = logging.getLogger(__name__)
     
     # Load model config
     model_args = OmegaConf.load(os.path.join(model_path, 'checkpoint/args.yaml'))
-    
-    # Load CSV metadata - it's in the data root directory
-    csv_path = os.path.join(project_root, 'data', 't15_copyTaskData_description.csv')
-    if not os.path.exists(csv_path):
-        # Try alternative location relative to data_dir
-        csv_path = os.path.join(os.path.dirname(data_dir), 't15_copyTaskData_description.csv')
-        if not os.path.exists(csv_path):
-            csv_path = os.path.join(data_dir, '..', '..', 't15_copyTaskData_description.csv')
-    
-    logger.info(f"Loading CSV metadata from: {csv_path}")
-    b2txt_csv_df = pd.read_csv(csv_path)
     
     # Initialize model
     model = GRUDecoder(
@@ -94,129 +85,206 @@ def load_model_and_data(model_path: str, data_dir: str, eval_type: str, device: 
     
     logger.info(f"Loaded model from {model_path}")
     
-    # Load evaluation data
-    eval_data = {}
-    total_trials = 0
+    # Load evaluation data using new dataset class
+    # data_dir points to hdf5_data_final, but dataset expects the parent directory
+    dataset_root = os.path.dirname(data_dir) if data_dir.endswith('hdf5_data_final') else data_dir
+    dataset = BrainToTextDataset(
+        data_root=dataset_root,
+        split=eval_type,
+        random_seed=42  # For reproducible results
+    )
     
-    for session in model_args['dataset']['sessions']:
-        session_dir = os.path.join(data_dir, session)
-        eval_file = os.path.join(session_dir, f'data_{eval_type}.hdf5')
-        
-        if os.path.exists(eval_file):
-            data = load_h5py_file(eval_file, b2txt_csv_df)
-            eval_data[session] = data
-            total_trials += len(data["neural_features"])
-            logger.info(f'Loaded {len(data["neural_features"])} {eval_type} trials for {session}')
+    logger.info(f'Loaded {len(dataset)} {eval_type} trials using new dataset class')
     
-    logger.info(f'Total {eval_type} trials: {total_trials}')
-    
-    return model, model_args, eval_data
+    return model, model_args, dataset
 
 
-def run_single_decoding_step(x, input_layer, model, model_args, device):
-    """Single decoding step function - smooths data and puts it through the model."""
-    # Use autocast for efficiency
-    with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", 
-                       enabled=model_args['use_amp'], dtype=torch.bfloat16):
-        
-        x = gauss_smooth(
-            inputs=x, 
-            device=device,
-            smooth_kernel_std=model_args['dataset']['data_transforms']['smooth_kernel_std'],
-            smooth_kernel_size=model_args['dataset']['data_transforms']['smooth_kernel_size'],
-            padding='valid',
-        )
-
-        with torch.no_grad():
-            logits, _ = model(
-                x=x,
-                day_idx=torch.tensor([input_layer], device=device),
-                states=None,  # no initial states
-                return_state=True,
-            )
-
-    # convert logits from bfloat16 to float32
-    logits = logits.float().cpu().numpy()
-
-    return logits
-
-
-def get_model_logits(model, model_args, eval_data, device):
-    """Get logits from the model for all evaluation data."""
+def process_and_decode_streaming(model, model_args, dataset, device, submission_config, batch_size=32):
+    """Stream processing: fetch batch -> RNN -> decode -> yield results."""
     logger = logging.getLogger(__name__)
     
-    logger.info("Generating logits for evaluation data...")
+    logger.info("Starting streaming processing: batch -> RNN -> decode -> results")
+    
+    # Initialize decoder once
+    decoder = Decoder()
+    logger.info(f"Initialized {decoder.decoder_type} decoder with optimized parameters")
+    
+    # Create DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,  # Keep original order for submission
+        collate_fn=collate_fn,
+        num_workers=0
+    )
+    
+    total_processed = 0
     
     with torch.no_grad():
-        for session, data in tqdm(eval_data.items(), desc="Sessions"):
-            data['logits'] = []
-            input_layer = model_args['dataset']['sessions'].index(session)
-            logger.info(f"Processing {session} with day_idx={input_layer}")
+        for batch in tqdm(dataloader, desc="Processing & decoding batches"):
+            # Step 1: RNN processing
+            input_features = batch['input_features'].to(device)
+            day_indices = batch['day_indices'].to(device)
             
-            for trial in tqdm(range(len(data['neural_features'])), desc=f"{session} trials", leave=False):
-                # Get neural input
-                neural_input = data['neural_features'][trial]
-                neural_input = np.expand_dims(neural_input, axis=0)
-                neural_input = torch.tensor(neural_input, device=device, dtype=torch.float32)
+            with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", 
+                               enabled=model_args['use_amp'], dtype=torch.bfloat16):
+                
+                # Apply smoothing
+                smoothed_input = gauss_smooth(
+                    inputs=input_features, 
+                    device=device,
+                    smooth_kernel_std=model_args['dataset']['data_transforms']['smooth_kernel_std'],
+                    smooth_kernel_size=model_args['dataset']['data_transforms']['smooth_kernel_size'],
+                    padding='valid',
+                )
                 
                 # Run model
-                logits = run_single_decoding_step(neural_input, input_layer, model, model_args, device)
-                data['logits'].append(logits)
+                logits, _ = model(
+                    x=smoothed_input,
+                    day_idx=day_indices,
+                    states=None,
+                    return_state=True,
+                )
+            
+            # Convert to float32 and move to CPU
+            logits = logits.float().cpu()
+            
+            # Step 2: Decode each trial in the batch
+            for i in range(len(batch['sessions'])):
+                # Calculate the correct logit length using the same formula as training
+                # IMPORTANT: In training, adjusted_lens uses the ORIGINAL n_time_steps, not smoothed length!
+                # The training code applies smoothing but doesn't update n_time_steps for the length calculation
+                original_length = batch['n_time_steps'][i].item()
+                
+                # Use the exact same formula as training: adjusted_lens = ((n_time_steps - patch_size) / patch_stride + 1)
+                # This uses ORIGINAL length, not smoothed length!
+                patch_size = model_args['model']['patch_size']
+                patch_stride = model_args['model']['patch_stride']
+                adjusted_lens = int((original_length - patch_size) / patch_stride + 1)
+                
+                # Ensure we don't exceed the actual logit tensor size
+                trim_length = min(adjusted_lens, logits.shape[1])
+                
+                # Extract logits for this trial (trim to correct length - NO PADDING!)
+                trial_logits = logits[i:i+1, :trim_length]  # Keep batch dimension
+                logit_lengths = torch.tensor([trim_length])
+                
+                # Decode
+                result = decoder.decode(trial_logits, logit_lengths)
+                
+                # Handle result format
+                if isinstance(result, list):
+                    result = result[0] if result else {'sentence': ''}
+                
+                pred_sentence = result.get('sentence', '') if isinstance(result, dict) else str(result)
+                
+                # Apply text normalization
+                if submission_config.get('lowercase', True):
+                    pred_sentence = pred_sentence.lower()
+                
+                if submission_config.get('strip_punct', True):
+                    pred_sentence = remove_punctuation(pred_sentence)
+                
+                if submission_config.get('collapse_space', True):
+                    pred_sentence = ' '.join(pred_sentence.split())
+                
+                pred_sentence = pred_sentence.strip()
+                
+                # Prepare result
+                result_data = {
+                    'session': batch['sessions'][i],
+                    'block_num': batch['block_nums'][i].item(),
+                    'trial_num': batch['trial_nums'][i].item(),
+                    'predicted_sentence': pred_sentence,
+                    'corpus': batch['corpora'][i]
+                }
+                
+                # Add ground truth if available (validation mode)
+                if 'sentence_labels' in batch:
+                    result_data['ground_truth'] = batch['sentence_labels'][i]
+                
+                # Yield result immediately
+                yield result_data
+                
+                total_processed += 1
     
-    logger.info("Logits generation completed")
+    logger.info(f"Completed streaming processing of {total_processed} trials")
 
 
-def decode_all_trials(eval_data, submission_config):
-    """Decode all trials using the decoder configuration from config.yaml."""
-    logger = logging.getLogger(__name__)
+def calculate_and_log_wer(submission_results, logger, submission_config):
+    """Calculate and log WER for validation results."""
+    total_wer = 0.0
+    total_cer = 0.0
+    total_words = 0
+    total_chars = 0
+    individual_wers = []
+    individual_cers = []
     
-    # Initialize decoder - automatically loads from decoding/config.yaml
-    decoder = Decoder()
+    logger.info("Calculating WER for validation results...")
     
-    logger.info(f"Initialized {decoder.decoder_type} decoder")
-    
-    # Collect results in chronological order
-    submission_results = []
-    
-    # Process sessions in order they appear in the config
-    for session in eval_data.keys():
-        data = eval_data[session]
+    for i, result in enumerate(submission_results):
+        pred_sentence = result['predicted_sentence']
+        true_sentence = result['ground_truth']
         
-        for trial in tqdm(range(len(data['logits'])), desc=f"Decoding {session}"):
-            # Get logits
-            logits = torch.tensor(data['logits'][trial][0], dtype=torch.float32)
+        # Apply same text normalization to ground truth
+        if submission_config.get('lowercase', True):
+            true_sentence = true_sentence.lower()
+        
+        if submission_config.get('strip_punct', True):
+            true_sentence = remove_punctuation(true_sentence)
+        
+        if submission_config.get('collapse_space', True):
+            true_sentence = ' '.join(true_sentence.split())
+        
+        true_sentence = true_sentence.strip()
+        
+        # Calculate WER and CER for this sample
+        try:
+            sample_wer = wer(true_sentence, pred_sentence)
+            sample_cer = cer(true_sentence, pred_sentence)
             
-            # Decode using new decoder architecture
-            result = decoder.decode(logits)
+            # Count words and characters
+            true_words = len(true_sentence.split())
+            true_chars = len(true_sentence)
             
-            # Handle both single result and batch result formats
-            if isinstance(result, list):
-                result = result[0] if result else {'sentence': ''}
+            # Accumulate for aggregate metrics
+            total_wer += sample_wer * true_words
+            total_cer += sample_cer * true_chars
+            total_words += true_words
+            total_chars += true_chars
             
-            pred_sentence = result.get('sentence', '') if isinstance(result, dict) else str(result)
+            individual_wers.append(sample_wer)
+            individual_cers.append(sample_cer)
             
-            # Apply submission text normalization
-            if submission_config.get('lowercase', True):
-                pred_sentence = pred_sentence.lower()
-            
-            if submission_config.get('strip_punct', True):
-                pred_sentence = remove_punctuation(pred_sentence)
-            
-            if submission_config.get('collapse_space', True):
-                pred_sentence = ' '.join(pred_sentence.split())
-            
-            pred_sentence = pred_sentence.strip()
-            
-            # Store result with metadata for ordering
-            submission_results.append({
-                'session': session,
-                'block_num': data['block_num'][trial],
-                'trial_num': data['trial_num'][trial],
-                'predicted_sentence': pred_sentence
-            })
+            # Log first few examples
+            if i < 5:
+                logger.info(f"Sample {i}:")
+                logger.info(f"  True: '{true_sentence}'")
+                logger.info(f"  Pred: '{pred_sentence}'")
+                logger.info(f"  WER: {sample_wer:.3f}, CER: {sample_cer:.3f}")
+                
+        except Exception as e:
+            logger.warning(f"Error calculating metrics for sample {i}: {e}")
+            individual_wers.append(1.0)
+            individual_cers.append(1.0)
     
-    logger.info(f"Decoded {len(submission_results)} trials")
-    return submission_results
+    # Calculate aggregate metrics
+    if total_words > 0 and total_chars > 0:
+        aggregate_wer = total_wer / total_words
+        aggregate_cer = total_cer / total_chars
+        mean_wer = np.mean(individual_wers)
+        mean_cer = np.mean(individual_cers)
+        
+        logger.info(f"\n=== WER RESULTS ===")
+        logger.info(f"Aggregate WER: {aggregate_wer:.4f} ({aggregate_wer*100:.2f}%)")
+        logger.info(f"Aggregate CER: {aggregate_cer:.4f} ({aggregate_cer*100:.2f}%)")
+        logger.info(f"Mean WER: {mean_wer:.4f} ({mean_wer*100:.2f}%)")
+        logger.info(f"Mean CER: {mean_cer:.4f} ({mean_cer*100:.2f}%)")
+        logger.info(f"Total samples: {len(submission_results)}")
+        logger.info(f"Total words: {total_words}")
+        logger.info(f"Total characters: {total_chars}")
+    else:
+        logger.warning("Could not calculate aggregate WER - no valid samples")
 
 
 def create_submission_csv(submission_results, output_path: str, eval_type: str):
@@ -285,19 +353,15 @@ def generate_submission(
     logger.info(f"Submission config: {submission_config}")
     
     # Load model and data
-    model, model_args, eval_data = load_model_and_data(model_path, data_dir, eval_type, device)
+    model, model_args, dataset = load_model_and_data(model_path, data_dir, eval_type, device)
     
-    # Get logits
+    # Stream processing: batch -> RNN -> decode -> results
     start_time = time.time()
-    get_model_logits(model, model_args, eval_data, device)
-    logits_time = time.time() - start_time
-    logger.info(f"Logits generation took {logits_time:.2f} seconds")
-    
-    # Decode all trials
-    start_time = time.time()
-    submission_results = decode_all_trials(eval_data, submission_config)
-    decode_time = time.time() - start_time
-    logger.info(f"Decoding took {decode_time:.2f} seconds")
+    submission_results = list(process_and_decode_streaming(
+        model, model_args, dataset, device, submission_config
+    ))
+    total_time = time.time() - start_time
+    logger.info(f"Total streaming processing took {total_time:.2f} seconds")
     
     # Create submission CSV
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -306,9 +370,12 @@ def generate_submission(
     
     submission_df = create_submission_csv(submission_results, output_path, eval_type)
     
+    # Calculate WER if validation mode (ground truth available)
+    if eval_type == 'val' and submission_results and 'ground_truth' in submission_results[0]:
+        calculate_and_log_wer(submission_results, logger, submission_config)
+    
     # Log summary statistics
-    logger.info(f"Total processing time: {logits_time + decode_time:.2f} seconds")
-    logger.info(f"Average time per trial: {(logits_time + decode_time) / len(submission_results):.3f} seconds")
+    logger.info(f"Average time per trial: {total_time / len(submission_results):.3f} seconds")
     
     # Save processing log
     log_data = {
@@ -316,9 +383,8 @@ def generate_submission(
         'data_dir': data_dir,
         'eval_type': eval_type,
         'total_trials': len(submission_results),
-        'logits_time': logits_time,
-        'decode_time': decode_time,
-        'total_time': logits_time + decode_time,
+        'total_time': total_time,
+        'processing_type': 'streaming',
         'submission_config': dict(submission_config),  # Convert to plain dict
         'output_file': output_path
     }

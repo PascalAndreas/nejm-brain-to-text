@@ -35,7 +35,7 @@ decoder:
 
 # Flashlight decoder parameters (optimized from focused parameter search)
 flashlight:
-  lm_weight: 4.5       # Optimal LM weight confirmed by search
+  lm_weight: 4.5       # Optimal LM weight from grid search (padding issue fixed)
   word_score: -0.7     # Stronger word penalty - best result from search
   beam_size: 100       # Optimal beam size - larger isn't better
   beam_size_token: 25  # Token-level beam size
