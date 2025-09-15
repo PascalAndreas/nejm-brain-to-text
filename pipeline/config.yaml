@@ -1,0 +1,194 @@
+# Brain-to-Text Pipeline Configuration
+# This configuration defines the complete pipeline from neural data to text
+
+# Dataset configuration
+dataset:
+  data_root: data/t15_copyTask_neuralData
+  batch_size: 32
+  num_workers: 8
+  pin_memory: true
+  
+  # Data splits to use
+  splits: [train, val, test]
+  
+  # Optional corpus filtering
+  corpus_filter: null  # e.g., ['50-Word', 'Switchboard']
+  
+  # Bad trials to exclude
+  bad_trials_dict: null
+  
+  # Random seed for reproducibility
+  random_seed: 42
+
+# Model configuration
+model:
+  name: gru_v1  # Model identifier from registry
+  
+  # Model parameters
+  params:
+    input_dim: 512
+    vocab_size: 41
+    num_days: 20
+    hidden_size: 768
+    num_layers: 5
+    dropout: 0.2
+    blank_idx: 0
+    
+    # PreNet configuration
+    prenet_config:
+      # Gaussian smoothing
+      smoother_config:
+        kernel_size: 100
+        std: 2.0
+        trainable: false
+      
+      # Day-specific adaptation (FiLM)
+      day_adapter_config:
+        grouping: blocks8  # 'full', 'blocks8', or integer
+        identity_init: true
+        l2_tether: 0.0001
+        l1_reg: 0.0
+      
+      # Patching configuration
+      patch_config:
+        size: 4  # Concatenate 4 frames
+        stride: 2  # Stride of 2 frames
+      
+      # Activation function
+      activation: softsign
+    
+    # Auxiliary CTC configuration (deep supervision)
+    aux_ctc_config:
+      layer: 3  # Attach to layer 3 of 5
+      weight: 0.25  # Weight for auxiliary loss
+    
+    # Temperature calibration
+    temperature: 1.0  # Will be fitted on validation set
+
+# Training configuration
+training:
+  # Optimizer settings
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+  
+  # Learning rate scheduler
+  scheduler:
+    type: cosine  # 'cosine' or 'onecycle'
+    warmup_steps: 5000
+    T_max: 100000
+    min_lr: 0.000001
+  
+  # Training settings
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  val_check_interval: 1000
+  log_every_n_steps: 100
+  
+  # Mixed precision training
+  precision: 16  # Use 16-bit precision for faster training
+  
+  # EMA configuration
+  use_ema: true
+  ema_decay: 0.999
+  
+  # Data augmentation
+  augmentation:
+    time_mask:
+      enabled: true
+      num_masks: 2
+      mask_width: 40
+    
+    channel_mask:
+      enabled: true
+      mask_prob: 0.1
+    
+    channel_dropout:
+      enabled: true
+      dropout_prob: 0.05
+    
+    noise_injection:
+      enabled: false
+      noise_std: 0.01
+
+# Decoding configuration
+decoding:
+  # Decoder implementation
+  impl: flashlight_ctc
+  
+  # Token and lexicon files
+  tokens: language_models/flashlight_decoder_vocab.txt
+  lexicon: language_models/lexicon.txt
+  
+  # Language model
+  kenlm: language_models/mixed-lower.binary
+  
+  # Decoder hyperparameters (to be tuned)
+  lm_weight: 2.5
+  word_score: -0.2
+  sil_score: 0.0
+  beam_size: 100
+  beam_size_token: 10
+  beam_threshold: 20.0
+  
+  # N-best list size for potential rescoring
+  nbest: 50
+  
+  # Greedy decoding for quick validation
+  use_greedy_for_val: true
+
+# Emission caching configuration
+emission_cache:
+  cache_dir: cache/emissions
+  format: npz  # 'npz', 'pt', or 'hdf5'
+  compress: true
+
+# Checkpoint configuration
+checkpointing:
+  save_dir: models/checkpoints
+  save_top_k: 3
+  monitor: val/per  # Phoneme error rate
+  mode: min
+  save_last: true
+  
+# Logging configuration
+logging:
+  logger: wandb  # 'wandb' or 'tensorboard'
+  project: brain-to-text
+  name: gru_ctc_baseline
+  save_dir: logs
+  log_model: false  # Log model artifacts to wandb
+  
+# Hardware configuration
+hardware:
+  accelerator: auto  # 'auto', 'gpu', 'mps', or 'cpu'
+  devices: 1  # Number of GPUs/devices
+  strategy: auto  # 'auto', 'ddp', 'dp', etc.
+  
+# Experiment tracking
+experiment:
+  seed: 42
+  deterministic: true
+  benchmark: false  # CUDNN benchmark
+  
+  # Tags for experiment tracking
+  tags:
+    - baseline
+    - gru
+    - ctc
+    - film
+    - ema
+  
+  # Notes
+  notes: |
+    Baseline GRU-CTC model with:
+    - Gaussian smoothing (kernel=100, std=2)
+    - Patching (size=4, stride=2)
+    - FiLM day adaptation with identity init
+    - 5-layer GRU with 768 hidden units
+    - Auxiliary CTC at layer 3
+    - EMA of weights (decay=0.999)
+    - Temperature calibration on validation set
