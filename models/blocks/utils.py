@@ -8,79 +8,9 @@ from typing import List, Dict, Any, Optional, Tuple
 import torch
 import torch.nn.functional as F
 import math
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
 
 
-def compute_output_lengths(
-    input_lengths: torch.LongTensor,
-    ops_config: List[Dict[str, Any]]
-) -> torch.LongTensor:
-    """Compute output lengths after a sequence of time-reducing operations.
-    
-    This is a pure function that composes length transformations from
-    various operations like patching, convolution, and pooling.
-    
-    Args:
-        input_lengths: Original sequence lengths [B]
-        ops_config: List of operations with their configurations
-            Each operation dict should have 'type' and relevant params:
-            - {'type': 'patch', 'size': N, 'stride': S}
-            - {'type': 'conv1d', 'kernel_size': K, 'stride': S, 'padding': P}
-            - {'type': 'pool', 'kernel_size': K, 'stride': S}
-            
-    Returns:
-        Output lengths after all operations [B]
-        
-    Example:
-        >>> lengths = torch.tensor([100, 150])
-        >>> ops = [
-        ...     {'type': 'patch', 'size': 4, 'stride': 2},
-        ...     {'type': 'conv1d', 'kernel_size': 3, 'stride': 1, 'padding': 1}
-        ... ]
-        >>> compute_output_lengths(lengths, ops)
-        tensor([49, 74])
-    """
-    lengths = input_lengths.clone()
-    
-    for op in ops_config:
-        op_type = op['type']
-        
-        if op_type == 'patch':
-            # Patching concatenates 'size' frames with 'stride' step
-            # Output length = floor((L - size) / stride) + 1 if L >= size, else 0
-            size = op['size']
-            stride = op.get('stride', size)  # Default stride = size (non-overlapping)
-            if size > 1:
-                has_valid_window = lengths >= size
-                new_lengths = torch.div(lengths - size, stride, rounding_mode='floor') + 1
-                lengths = torch.where(has_valid_window, new_lengths, torch.zeros_like(lengths))
-                
-        elif op_type == 'conv1d':
-            # Standard convolution length formula
-            kernel_size = op['kernel_size']
-            stride = op.get('stride', 1)
-            padding = op.get('padding', 0)
-            dilation = op.get('dilation', 1)
-            
-            effective_kernel = (kernel_size - 1) * dilation + 1
-            lengths = torch.floor((lengths + 2 * padding - effective_kernel) / stride).long() + 1
-            
-        elif op_type == 'pool':
-            # Pooling length formula
-            kernel_size = op['kernel_size']
-            stride = op.get('stride', kernel_size)
-            padding = op.get('padding', 0)
-            
-            lengths = torch.floor((lengths + 2 * padding - kernel_size) / stride).long() + 1
-            
-        elif op_type == 'downsample':
-            # Simple downsampling by factor
-            factor = op['factor']
-            lengths = torch.ceil(lengths / factor).long()
-            
-        # Ensure lengths stay positive
-        lengths = torch.clamp(lengths, min=1)
-    
-    return lengths
 
 
 def mask_logits_(
@@ -178,10 +108,14 @@ def apply_patch_embedding(
     
     # Update lengths if provided
     if lengths is not None:
-        lengths = compute_output_lengths(
-            lengths,
-            [{'type': 'patch', 'size': patch_size, 'stride': patch_stride}]
-        )
+        # Patching concatenates 'patch_size' frames with 'patch_stride' step
+        # Output length = floor((L - patch_size) / patch_stride) + 1 if L >= patch_size, else 0
+        if patch_size > 1:
+            has_valid_window = lengths >= patch_size
+            new_lengths = torch.div(lengths - patch_size, patch_stride, rounding_mode='floor') + 1
+            lengths = torch.where(has_valid_window, new_lengths, torch.zeros_like(lengths))
+            # Ensure lengths stay positive
+            lengths = torch.clamp(lengths, min=1)
     
     return patches, lengths
 
@@ -214,43 +148,151 @@ def get_activation_fn(name: str) -> torch.nn.Module:
     return activations[name]()
 
 
-def calculate_conv_output_length(
-    input_length: int,
-    kernel_size: int,
-    stride: int = 1,
-    padding: int = 0,
-    dilation: int = 1
-) -> int:
-    """Calculate output length for 1D convolution.
-    
-    Args:
-        input_length: Input sequence length
-        kernel_size: Convolution kernel size
-        stride: Convolution stride
-        padding: Padding on both sides
-        dilation: Dilation factor
-        
-    Returns:
-        Output sequence length
-    """
-    effective_kernel = (kernel_size - 1) * dilation + 1
-    return math.floor((input_length + 2 * padding - effective_kernel) / stride) + 1
+# RNN Helper Functions
+# These are shared between GRU and LSTM implementations
+
+def feat_dim_from_seq(seq, max_len, default):
+    """Get feature dimension from sequence, handling both PackedSequence and tensor."""
+    if isinstance(seq, PackedSequence):
+        # data is [sum(batch_sizes), F]
+        return seq.data.size(-1)
+    else:
+        return seq.size(-1) if seq.dim() == 3 else default
 
 
-def create_causal_mask(
-    seq_len: int,
-    device: torch.device,
-    dtype: torch.dtype = torch.bool
+def expand_h0(p, B, device, dtype):
+    """Expand learnable h0 parameter to batch size."""
+    return p.to(device=device, dtype=dtype).expand(-1, B, -1).contiguous()
+
+
+def apply_locked_dropout(
+    seq: torch.Tensor, 
+    dropout_p: float,
+    batch_size: int, 
+    max_len: int,
+    output_size: int
 ) -> torch.Tensor:
-    """Create a causal mask for autoregressive attention.
+    """Apply locked dropout with consistent masks across time.
+    
+    Locked dropout uses the same dropout mask across all time steps
+    for each sample, which helps preserve temporal dependencies better
+    than standard dropout. Masks are regenerated for each forward pass.
     
     Args:
-        seq_len: Sequence length
-        device: Device to create mask on
-        dtype: Data type for mask
+        seq: Input sequence (PackedSequence or tensor)
+        dropout_p: Dropout probability
+        batch_size: Batch size
+        max_len: Maximum sequence length
+        output_size: Default output size for feature dimension
         
     Returns:
-        Causal mask [seq_len, seq_len] where True indicates valid positions
+        Sequence with locked dropout applied
     """
-    mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=dtype), diagonal=1)
-    return ~mask  # Invert so True means "can attend"
+    if dropout_p <= 0:
+        return seq
+        
+    if isinstance(seq, PackedSequence):
+        # Unpack for dropout application
+        x, lengths = pad_packed_sequence(seq, batch_first=True, total_length=max_len)
+        
+        # Get feature dimension from actual sequence
+        feat_dim = feat_dim_from_seq(seq, max_len, output_size)
+        
+        # Create mask: [B, 1, F] - broadcasts across time dimension
+        # Generate fresh mask for each forward pass
+        mask = x.new_empty((batch_size, 1, feat_dim)).bernoulli_(1 - dropout_p).div_(1 - dropout_p)
+        
+        # Apply mask to all time steps
+        x = x * mask
+        
+        # Repack the sequence
+        return pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+    else:
+        # Handle regular tensor (not packed)
+        B, T, F = seq.shape
+        
+        # Create mask: [B, 1, F] - broadcasts across time dimension
+        # Generate fresh mask for each forward pass
+        mask = seq.new_empty((B, 1, F)).bernoulli_(1 - dropout_p).div_(1 - dropout_p)
+        
+        # Apply mask (broadcasts across time dimension)
+        return seq * mask
+
+
+def apply_output_zoneout(
+    seq, zoneout_p, lengths, max_len, bidirectional=False
+):
+    """Apply output zoneout regularization.
+    
+    Output zoneout mixes current hidden states with previous time step states,
+    providing regularization similar to true zoneout but compatible with cuDNN.
+    
+    Args:
+        seq: Input sequence (PackedSequence or tensor)
+        zoneout_p: Zoneout probability
+        lengths: Sequence lengths
+        max_len: Maximum sequence length
+        bidirectional: Whether the sequence is bidirectional
+        
+    Returns:
+        Sequence with zoneout applied
+    """
+    if zoneout_p <= 0:
+        return seq
+
+    if isinstance(seq, PackedSequence):
+        x, lens = pad_packed_sequence(seq, batch_first=True, total_length=max_len)
+    else:
+        x, lens = seq, lengths
+
+    # x: [B, T, F]; build time-shifted prev state (forward dir)
+    prev = x.clone()
+    prev[:, 1:] = x[:, :-1]
+    # for t=0, keep the first state
+    
+    # bidirectional handling: split, shift independently, then cat
+    if bidirectional:
+        F = x.size(-1) // 2
+        fwd, bwd = x[..., :F], x[..., F:]
+        f_prev, b_prev = fwd.clone(), bwd.clone()
+        f_prev[:, 1:] = fwd[:, :-1]      # forward uses t-1
+        b_prev[:, :-1] = bwd[:, 1:]      # backward uses t+1
+        prev = torch.cat([f_prev, b_prev], dim=-1)
+
+    # Build a locked mask: [B, 1, F]
+    mask = x.new_empty((x.size(0), 1, x.size(-1))).bernoulli_(1 - zoneout_p)
+    # Keep expected value unchanged
+    mask = mask / (1 - zoneout_p)
+
+    # Apply: m * prev + (1-m) * x
+    y = mask * prev + (1 - mask) * x
+
+    # Zero-out padded timesteps so they don't leak
+    if lens is not None:
+        # build boolean mask [B, T, 1]
+        tt = torch.arange(max_len, device=x.device).unsqueeze(0)
+        valid = tt < lens.unsqueeze(1)
+        y = y * valid.unsqueeze(-1)
+
+    if isinstance(seq, PackedSequence):
+        return pack_padded_sequence(y, lens.cpu(), batch_first=True, enforce_sorted=False)
+    else:
+        return y
+
+
+def apply_interlayer_dropout(seq, layer_idx, batch_size, max_len, dropout, dropout_type, num_layers, output_size, dropout_modules, training):
+    """Apply inter-layer dropout (locked or standard)."""
+    if not training or dropout <= 0 or layer_idx == num_layers - 1:
+        return seq
+    
+    if dropout_type == 'locked':
+        return apply_locked_dropout(seq, dropout, batch_size, max_len, output_size)
+    else:
+        # Standard dropout
+        if isinstance(seq, PackedSequence):
+            data = dropout_modules[layer_idx](seq.data)
+            return PackedSequence(data, seq.batch_sizes, seq.sorted_indices, seq.unsorted_indices)
+        else:
+            return dropout_modules[layer_idx](seq)
+
+

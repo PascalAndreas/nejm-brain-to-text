@@ -5,7 +5,7 @@ representations to output vocabulary, including support for auxiliary
 CTC heads for deep supervision.
 """
 
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -186,7 +186,7 @@ class MultiHeadProjection(nn.Module):
         self,
         x: torch.FloatTensor,
         return_all: bool = False
-    ) -> torch.FloatTensor | Tuple[torch.FloatTensor, torch.FloatTensor]:
+    ) -> Union[torch.FloatTensor, Tuple[torch.FloatTensor, torch.FloatTensor]]:
         """Project through multiple heads.
         
         Args:

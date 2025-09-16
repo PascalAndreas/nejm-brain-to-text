@@ -4,12 +4,12 @@ This module contains preprocessing blocks that are applied to raw neural
 signals before the main encoder backbone (excluding smoothing).
 """
 
-from typing import Optional, Literal, Tuple, Dict, Any, List
+from typing import Optional, Literal, Tuple, Dict, Any, List, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from .utils import apply_patch_embedding, compute_output_lengths, get_activation_fn
+from .utils import apply_patch_embedding, get_activation_fn
 
 
 class DayAdapter(nn.Module):
@@ -31,7 +31,7 @@ class DayAdapter(nn.Module):
         self,
         num_features: int,
         num_days: int,
-        grouping: Literal['full', 'blocks8'] | int = 'full',
+        grouping: Union[Literal['full', 'blocks8'], int] = 'full',
         identity_init: bool = True,
         l2_tether: float = 1e-4,
         l1_reg: float = 0.0

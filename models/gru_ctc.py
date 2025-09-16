@@ -16,7 +16,6 @@ from .blocks import (
     CTCHead,
     AuxiliaryHead,
     TemperatureScaling,
-    compute_output_lengths,
     mask_logits_
 )
 from .blocks.smoothers import build_smoother, SmootherBase
@@ -211,11 +210,17 @@ class GRUCTC(NeuralEncoder):
                 # Get auxiliary predictions
                 aux_logits = self.aux_head(aux_features)
                 
+                # For auxiliary outputs, lengths should be the same as main output
+                # since all GRU layers have the same time dimension (no internal stride)
+                # The time reduction happens in PreNet (patching) before the GRU backbone
+                aux_lengths = lengths
+                
                 # Apply masking and log-softmax
-                mask_logits_(aux_logits, lengths)
+                mask_logits_(aux_logits, aux_lengths)
                 aux_log_probs = F.log_softmax(aux_logits, dim=-1)
                 
                 aux_outputs['aux_log_probs'] = aux_log_probs
+                aux_outputs['aux_lengths'] = aux_lengths  # Store for verification
                 aux_outputs['aux_layer'] = self.aux_layer
         
         # Add regularization loss if applicable

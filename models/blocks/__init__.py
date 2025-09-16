@@ -14,7 +14,7 @@ from .smoothers import (
     build_smoother,
     SMOOTHERS
 )
-from .rnn import GRUBackbone, LSTMBackbone, VariationalGRU
+from .rnn import GRUBackbone, LSTMBackbone
 from .head import ProjectionHead, AuxiliaryHead, MultiHeadProjection, CTCHead
 from .calibrator import TemperatureScaling, PlattScaling, EnsembleTemperature
 from .utils import (
@@ -44,7 +44,6 @@ __all__ = [
     # RNN backbones
     "GRUBackbone",
     "LSTMBackbone",
-    "VariationalGRU",
     
     # Projection heads
     "ProjectionHead",

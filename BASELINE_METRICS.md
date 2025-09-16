@@ -12,6 +12,31 @@ This document provides comprehensive baseline metrics from the pretrained RNN mo
 - **Training method**: CTC loss with AdamW optimizer
 - **Data augmentation**: Gaussian noise, temporal jitter, smoothing (kernel=100, std=2)
 
+## Parameter Breakdown
+
+**Total Parameters**: 36,974,633 (all trainable)
+**Model Size**: 141.0 MB (float32)
+
+### Component Distribution
+
+| **Component** | **Parameters** | **Percentage** | **Details** |
+|---------------|----------------|----------------|-------------|
+| **Day-specific Input Layers** | 11,556,864 | 31.3% | 44 days × (512×512 weights + 512 biases) |
+| **GRU Layers** | 25,385,472 | 68.7% | 5 layers with patched input (14 timesteps) |
+| **Initial Hidden State** | 768 | 0.0% | Learnable h₀ initialization |
+| **Output Layer** | 31,529 | 0.1% | 768 → 41 linear projection |
+
+### GRU Layer Breakdown
+- **First layer**: 18,289,152 parameters (handles patched input: 512×14=7,168 features)
+- **Remaining 4 layers**: 7,096,320 parameters (1,774,080 each)
+- Each GRU layer has 3 gates (reset, update, new) with input-to-hidden and hidden-to-hidden weights plus biases
+
+### Key Insights
+- **GRU dominance**: 68.7% of parameters in recurrent layers for temporal modeling
+- **Day adaptation**: 31.3% dedicated to cross-day neural signal adaptation
+- **Patching effect**: Input patching (14 timesteps, stride 4) increases first layer complexity
+- **Minimal output**: Only 0.1% for phoneme classification (768→41 mapping)
+
 ## Training Configuration
 
 - **Total batches**: 120,000
