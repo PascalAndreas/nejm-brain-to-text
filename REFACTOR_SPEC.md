@@ -82,10 +82,11 @@ build_encoder(name: str, cfg: dict) -> NeuralEncoder
 ```
 NeuralEncoder =
   PreNet(
-    GaussianSmoother(),           # MVP: fixed Gaussian (kernel=100, std=2) to match legacy
-    DayAdapter(),                 # FiLM(γ,β) identity‑init; optional group‑wise (8 blocks)
-    Nonlinearity(softsign)        # to match legacy behavior
-    # (Later: TypeAwareNormalize, LearnedDepthwiseConv, etc.)
+    DepthwiseCausalSmoother(),    # Learnable causal smoothing with residual gate (default)
+    # OR GaussianSmoother(),      # Fixed Gaussian (kernel=100, std=2) for legacy compat
+    DayAdapter(),                 # Vectorized FiLM with delta parameterization (γ = 1 + Δγ)
+    Nonlinearity(softsign),       # Applied before patching for better feature quality
+    PatchEmbedding()              # Frame concatenation for temporal context (optional)
   )
   └─ EncoderBackbone()            # GRU (uni; causal) for MVP; Conformer later
   └─ ProjectionHead()             # Linear(d_hidden → V)
@@ -93,18 +94,41 @@ NeuralEncoder =
   └─ LogSoftmax()                 # produce log_probs for CTC & decoding
 ```
 
-### PreNet details (MVP)
+### PreNet details (Finalized)
 
-* **GaussianSmoother**: deterministic; applies along time per feature. Keep params identical to current baseline (kernel size = 100 frames; std = 2). Expose in config.
-* **DayAdapter (FiLM)**:
+**Operation Order**: Smoothing → Day Adaptation → Activation → Patching
 
-  * `y = γ_d ⊙ x + β_d`
-  * Identity init: `γ_d = 1`, `β_d = 0`
-  * Regularization: L2 tether on `(γ_d−1, β_d−0)`; optional L1 for sparsity
-  * Option: *group-wise FiLM* (one `(γ,β)` per the 8 predefined blocks of 64 chans)
-* **Softsign** activation after FiLM.
+* **DepthwiseCausalSmoother** (default):
+  * Learnable depthwise causal convolution with softmax-parameterized kernels
+  * Residual gate: `y = (1-α)x + α·conv(x)` where α ≈ 0.2 initially
+  * Gaussian initialization for exact smoothing behavior (std=2.0, kernel=11)
+  * Per-feature independent kernels constrained to sum=1
 
-> Later variants: Type-aware normalization (sqrt for thresholds, log1p for power, then robust per-day z-score), learned depthwise 1D conv as smoother.
+* **GaussianSmoother** (legacy compatibility):
+  * Fixed Gaussian kernel (size=100, std=2) for backward compatibility
+  * Deterministic; applies along time dimension per feature
+
+* **DayAdapter (Vectorized FiLM)**:
+  * Delta parameterization: `γ = 1 + Δγ` for better identity bias
+  * Vectorized lookup: single tensors instead of ParameterList for efficiency
+  * `y = (1 + Δγ_d) ⊙ x + β_d` where Δγ_d, β_d are per-day parameters
+  * Identity init: `Δγ_d = 0`, `β_d = 0`
+  * Scale-invariant regularization: L2 tether using means, not sums
+  * Device-safe zero tensor returns
+  * Grouping options: 'full', 'blocks8', or custom integer for parameter efficiency
+
+* **Activation Function** (before patching):
+  * Applied after day adaptation but before patching
+  * Default: softsign for legacy compatibility
+  * Operates on original feature dimension for efficiency
+
+* **PatchEmbedding** (optional):
+  * Frame concatenation using causal unfold operation
+  * Configurable patch_size and patch_stride
+  * Proper length tracking with `compute_output_lengths`
+  * Applied last to create temporal context patches
+
+> Future variants: Type-aware normalization, learned attention-based smoothing.
 
 ### EncoderBackbone (GRU‑CTC MVP)
 
@@ -203,18 +227,24 @@ Mirror the same responsibilities. Keep AMP, grad-clip, seeding, and checkpointin
 
 ---
 
-## 9) Day Adapters (safe default)
+## 9) Day Adapters (Production Ready)
 
-* **FiLM(γ,β)** per feature or **per block** (8 blocks of 64 channels).
-* Identity‑init; add **L2 tether** on deviations; (optional) L1.
-* Log ‖(γ−1,β−0)‖ per day in W\&B; alert on outliers.
+* **Vectorized FiLM** with delta parameterization: `γ = 1 + Δγ` for better identity bias
+* **Efficient implementation**: Single tensors with vectorized lookup (no Python loops)
+* **Scale-invariant regularization**: L2 tether using means, not sums (independent of parameter count)
+* **Grouping options**: 'full' (all features), 'blocks8' (8×64 channels), or custom integer
+* **Device safety**: Proper tensor device handling for mixed-device training
+* **Statistics tracking**: Enhanced day-wise parameter monitoring with delta statistics
+* Log ‖Δγ‖, ‖β‖ per day in W&B; monitor for runaway adaptation
 
 ---
 
-## 10) Smoothing & Normalization (MVP and beyond)
+## 10) Smoothing & Normalization (Production Ready)
 
-* **MVP**: GaussianSmoother → FiLM → softsign (PreNet).
-* **Later**: Type-aware transforms (threshold: sqrt/Anscombe; power: log1p) + robust per‑day z-score, then learned depthwise conv as smoother.
+* **Current**: DepthwiseCausalSmoother → FiLM → softsign → patching (PreNet)
+* **DepthwiseCausalSmoother**: Learnable per-channel causal kernels with residual connections
+* **Legacy compatibility**: GaussianSmoother option for exact backward compatibility
+* **Future**: Type-aware transforms (threshold: sqrt/Anscombe; power: log1p) + robust per‑day z-score
 
 ---
 
@@ -241,7 +271,7 @@ models/
   __init__.py          # registry + build_encoder()
   base.py              # Batch/Emissions/NeuralEncoder contracts
   blocks/
-    prenet.py          # GaussianSmoother, DayAdapter(FiLM), Softsign, (later: TypeAwareNormalize, DepthwiseConv)
+    prenet.py          # DepthwiseCausalSmoother, GaussianSmoother, Vectorized DayAdapter(FiLM), PatchEmbedding
     rnn.py             # GRU stack (causal)
     conformer.py       # (future)
     head.py            # Linear projection; AuxHead for mid-CTC
@@ -272,9 +302,11 @@ model:
   name: gru_v1
   vocab_size: 41
   prenet:
-    smoother: {type: gaussian, kernel: 100, std: 2}
-    day_adapter: {type: film, grouping: blocks8, l2_tether: 1e-4, l1: 0.0}
-    nonlinearity: softsign
+    smoother: {type: depthwise_causal, kernel_size: 11, residual_gate: true, init_std: 2.0}
+    # OR smoother: {type: gaussian, kernel_size: 100, std: 2.0}  # legacy compatibility
+    day_adapter: {grouping: blocks8, l2_tether: 1e-4, l1_reg: 0.0, identity_init: true}
+    activation: softsign
+    patch: {size: 14, stride: 4}  # optional patching
   backbone:
     type: gru
     hidden_size: 768
@@ -312,9 +344,14 @@ decoding:
 ## 15) Migration Checklist (MVP)
 
 * [ ] Implement `models/base.py` contracts and registry.
-* [ ] Implement PreNet(MVP): GaussianSmoother → FiLM → Softsign.
+* [x] **Implement PreNet (Production Ready)**: DepthwiseCausalSmoother → Vectorized FiLM → Softsign → Patching
+  * [x] Vectorized day lookup with single tensors
+  * [x] Delta parameterization (γ = 1 + Δγ) for identity bias  
+  * [x] Scale-invariant regularization using means
+  * [x] Device-safe tensor operations
+  * [x] Proper operation ordering and length tracking
 * [ ] Implement GRU backbone with packing; ProjectionHead; Calibrator (T fit optional later).
-* [ ] Implement `compute_output_lengths` + `mask_logits_` and use them.
+* [x] **Implement `compute_output_lengths` + `mask_logits_`** and use them.
 * [ ] Write the 3 unit tests; run on CI.
 * [ ] Add `pipeline/emit.py` to cache emissions.
 * [ ] Keep current `/decoding` and grid/Bayes search; ensure it reads `out_lens` exactly.

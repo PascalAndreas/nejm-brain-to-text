@@ -130,6 +130,29 @@ class Emissions:
     def vocab_size(self) -> int:
         """Get vocabulary size (including blank)."""
         return self.log_probs.shape[2]
+    
+    def to(self, device: torch.device) -> 'Emissions':
+        """Move emissions to specified device.
+        
+        Args:
+            device: Target device
+            
+        Returns:
+            New Emissions instance on target device
+        """
+        return Emissions(
+            log_probs=self.log_probs.to(device),
+            out_lens=self.out_lens.to(device),
+            aux=self.aux  # aux dict is not moved (contains arbitrary objects)
+        )
+    
+    def cpu(self) -> 'Emissions':
+        """Move emissions to CPU.
+        
+        Returns:
+            New Emissions instance on CPU
+        """
+        return self.to(torch.device('cpu'))
 
 
 class NeuralEncoder(nn.Module, ABC):

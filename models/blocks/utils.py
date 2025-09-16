@@ -46,11 +46,13 @@ def compute_output_lengths(
         
         if op_type == 'patch':
             # Patching concatenates 'size' frames with 'stride' step
-            # Output length = floor((L - size) / stride) + 1
+            # Output length = floor((L - size) / stride) + 1 if L >= size, else 0
             size = op['size']
             stride = op.get('stride', size)  # Default stride = size (non-overlapping)
             if size > 1:
-                lengths = torch.floor((lengths - size) / stride).long() + 1
+                has_valid_window = lengths >= size
+                new_lengths = torch.div(lengths - size, stride, rounding_mode='floor') + 1
+                lengths = torch.where(has_valid_window, new_lengths, torch.zeros_like(lengths))
                 
         elif op_type == 'conv1d':
             # Standard convolution length formula
@@ -127,7 +129,6 @@ def create_padding_mask(
     if max_len is None:
         max_len = lengths.max().item()
     
-    batch_size = lengths.shape[0]
     mask = torch.arange(max_len, device=lengths.device).unsqueeze(0)
     mask = mask < lengths.unsqueeze(1)
     

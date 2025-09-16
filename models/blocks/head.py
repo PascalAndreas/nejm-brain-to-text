@@ -293,7 +293,8 @@ class CTCHead(nn.Module):
         if temperature != 1.0:
             logits = logits / temperature
         
-        # Mask invalid positions if lengths provided
+        # CRITICAL: Mask invalid positions BEFORE log_softmax
+        # This ensures padded positions don't affect the normalization
         if lengths is not None:
             from .utils import mask_logits_
             mask_logits_(logits, lengths)

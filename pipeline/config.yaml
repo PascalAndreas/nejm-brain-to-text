@@ -34,17 +34,15 @@ model:
     dropout: 0.2
     blank_idx: 0
     
-    # PreNet configuration
+    # Smoother configuration (separate from PreNet)
+    smoother_config:
+      type: depthwise_causal  # 'gaussian', 'depthwise_causal', 'ema', or 'identity'
+      kernel_size: 11  # Kernel size for convolution-based smoothers
+      residual_gate: true  # Gated residual connection
+      init_std: 2.0  # Standard deviation for initialization
+    
+    # PreNet configuration (no longer includes smoother)
     prenet_config:
-      # Use learnable depthwise causal smoother
-      use_depthwise_smoother: true
-      
-      # Smoother configuration
-      smoother_config:
-        kernel_size: 11  # Smaller kernel for causal conv
-        std: 2.0  # For initialization
-        residual_gate: true  # Gated residual connection
-      
       # Day-specific adaptation (FiLM)
       day_adapter_config:
         grouping: blocks8  # 'full', 'blocks8', or integer
@@ -60,10 +58,8 @@ model:
       # Activation function
       activation: softsign
     
-    # Auxiliary CTC configuration (deep supervision)
-    aux_ctc_config:
-      layer: 3  # Attach to layer 3 of 5
-      weight: 0.25  # Weight for auxiliary loss
+    # Auxiliary layer for deep supervision (None to disable)
+    aux_layer: 3  # Attach to layer 3 of 5
     
     # Temperature calibration
     temperature: 1.0  # Will be fitted on validation set
@@ -79,10 +75,20 @@ training:
   
   # Learning rate scheduler
   scheduler:
-    type: cosine  # 'cosine' or 'onecycle'
+    type: warmup_cosine  # 'cosine', 'warmup_cosine', 'onecycle', etc.
     warmup_steps: 5000
     T_max: 100000
     min_lr: 0.000001
+  
+  # Auxiliary CTC loss configuration (deep supervision)
+  aux_loss:
+    enabled: true  # Enable auxiliary loss
+    weight: 0.25  # Base weight for auxiliary loss
+    schedule:  # Weight scheduling
+      type: warmup_decay  # 'constant', 'warmup', 'warmup_decay', 'linear_decay'
+      warmup_steps: 5000  # Ramp up to full weight
+      hold_steps: 50000  # Hold at full weight  
+      decay_steps: 30000  # Decay to 0
   
   # Training settings
   max_epochs: 100
@@ -189,12 +195,13 @@ experiment:
   
   # Notes
   notes: |
-    Improved GRU-CTC model with:
-    - Learnable depthwise causal smoothing (kernel=11, residual gate)
+    Refactored GRU-CTC model with modular architecture:
+    - Separate smoother module (depthwise causal, k=11, residual gate)
+    - FiLM day adaptation with delta parameterization and L2 tethering
     - Patching (size=4, stride=2) for length reduction
-    - FiLM day adaptation with identity init and L2 tethering
     - 5-layer GRU with 768 hidden units and packed sequences
-    - Auxiliary CTC at layer 3 for deep supervision
+    - Auxiliary CTC at layer 3 with warmup-decay scheduling
+    - Main CTC head with proper masking before log_softmax
     - Bias-corrected EMA with adaptive update schedule
     - Temperature calibration on validation set
     - Weights & Biases logging for experiment tracking

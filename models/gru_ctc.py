@@ -1,7 +1,7 @@
 """GRU-CTC neural encoder implementation.
 
 This module implements the main GRU-based CTC encoder by composing
-the various building blocks (PreNet, GRU backbone, projection heads).
+the various building blocks (Smoother, PreNet, GRU backbone, projection heads).
 """
 
 from typing import Dict, Any, Optional, List, Tuple
@@ -19,17 +19,19 @@ from .blocks import (
     compute_output_lengths,
     mask_logits_
 )
+from .blocks.smoothers import build_smoother, SmootherBase
 
 
 class GRUCTC(NeuralEncoder):
     """GRU-based neural encoder with CTC output head.
     
     This model implements the complete pipeline:
-    1. PreNet: Gaussian smoothing → Patching → Day adaptation → Activation
-    2. GRU Backbone: Multi-layer GRU with packed sequence support
-    3. Projection Head: Linear projection to vocabulary
-    4. Optional: Auxiliary CTC head for deep supervision
-    5. Optional: Temperature calibration
+    1. Smoother: Temporal smoothing (learnable or fixed)
+    2. PreNet: Day Adaptation → Activation → Patching
+    3. GRU Backbone: Multi-layer GRU with packed sequence support
+    4. Projection Head: Linear projection to vocabulary
+    5. Optional: Auxiliary CTC head for deep supervision
+    6. Optional: Temperature calibration
     
     Args:
         input_dim: Number of input features
@@ -38,8 +40,9 @@ class GRUCTC(NeuralEncoder):
         hidden_size: GRU hidden state size
         num_layers: Number of GRU layers
         dropout: Dropout probability
+        smoother_config: Configuration for temporal smoother
         prenet_config: Configuration for PreNet
-        aux_ctc_config: Configuration for auxiliary CTC head
+        aux_layer: Layer index for auxiliary CTC (None to disable)
         temperature: Initial temperature for calibration
         blank_idx: Index of CTC blank token
     """
@@ -52,8 +55,9 @@ class GRUCTC(NeuralEncoder):
         hidden_size: int = 768,
         num_layers: int = 5,
         dropout: float = 0.2,
+        smoother_config: Optional[Dict[str, Any]] = None,
         prenet_config: Optional[Dict[str, Any]] = None,
-        aux_ctc_config: Optional[Dict[str, Any]] = None,
+        aux_layer: Optional[int] = None,
         temperature: float = 1.0,
         blank_idx: int = 0
     ):
@@ -65,16 +69,28 @@ class GRUCTC(NeuralEncoder):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.blank_idx = blank_idx
+        self.aux_layer = aux_layer
         
-        # Default PreNet configuration
+        # Default smoother configuration
+        if smoother_config is None:
+            smoother_config = {
+                'type': 'depthwise_causal',
+                'kernel_size': 11,
+                'residual_gate': True,
+                'init_std': 2.0
+            }
+        
+        # Create smoother
+        smoother_type = smoother_config.pop('type', 'depthwise_causal')
+        self.smoother = build_smoother(
+            smoother_type=smoother_type,
+            num_features=input_dim,
+            config=smoother_config
+        )
+        
+        # Default PreNet configuration (no longer includes smoother)
         if prenet_config is None:
             prenet_config = {
-                'use_depthwise_smoother': True,  # Use learnable causal smoother
-                'smoother_config': {
-                    'kernel_size': 11,  # Smaller kernel for causal conv
-                    'std': 2.0,  # For initialization
-                    'residual_gate': True  # Gated residual
-                },
                 'day_adapter_config': {
                     'grouping': 'blocks8',
                     'identity_init': True,
@@ -88,7 +104,7 @@ class GRUCTC(NeuralEncoder):
                 'activation': 'softsign'
             }
         
-        # Create PreNet
+        # Create PreNet (now without smoother)
         self.prenet = PreNet(
             input_dim=input_dim,
             num_days=num_days,
@@ -110,7 +126,7 @@ class GRUCTC(NeuralEncoder):
             learnable_h0=True
         )
         
-        # Main CTC head
+        # Main CTC head (now with built-in masking)
         self.ctc_head = CTCHead(
             input_size=self.backbone.output_size,
             vocab_size=vocab_size,
@@ -120,24 +136,19 @@ class GRUCTC(NeuralEncoder):
         
         # Optional auxiliary CTC head for deep supervision
         self.aux_head = None
-        self.aux_layer = None
-        self.aux_weight = 0.0
-        
-        if aux_ctc_config is not None:
-            self.aux_layer = aux_ctc_config.get('layer', num_layers // 2)
-            self.aux_weight = aux_ctc_config.get('weight', 0.25)
-            
-            self.aux_head = AuxiliaryHead(
-                input_size=hidden_size,
-                vocab_size=vocab_size,
-                hidden_size=None,  # Direct projection
-                dropout=dropout / 2,
-                layer_norm=True
-            )
-            
-            # Register hook to capture intermediate representations
-            self._aux_features = None
-            self._register_aux_hook()
+        if aux_layer is not None and 0 <= aux_layer < num_layers:
+            # Check if backbone supports auxiliary outputs
+            if hasattr(self.backbone, 'supports_aux') and self.backbone.supports_aux():
+                self.aux_head = AuxiliaryHead(
+                    input_size=self.backbone.output_size,
+                    vocab_size=vocab_size,
+                    hidden_size=None,  # Direct projection
+                    dropout=dropout / 2,
+                    layer_norm=True
+                )
+            else:
+                print(f"Warning: Backbone {type(self.backbone).__name__} does not support auxiliary outputs")
+                self.aux_layer = None
         
         # Temperature calibration
         self.calibrator = TemperatureScaling(
@@ -154,25 +165,6 @@ class GRUCTC(NeuralEncoder):
                 # This is approximate; exact reduction depends on input length
                 self._time_reduction = patch_stride
     
-    def _register_aux_hook(self):
-        """Register forward hook to capture intermediate GRU features."""
-        if self.aux_head is None:
-            return
-        
-        def hook_fn(module, input, output):
-            # For GRU: output is (output_seq, hidden_states)
-            if isinstance(output, tuple):
-                output_seq = output[0]
-            else:
-                output_seq = output
-            
-            # Store intermediate features
-            # We'll extract the specific layer output later
-            self._aux_features = output_seq
-        
-        # Register hook on the GRU module
-        self.backbone.gru.register_forward_hook(hook_fn)
-    
     def forward(self, batch: Batch) -> Emissions:
         """Forward pass through the encoder.
         
@@ -187,13 +179,20 @@ class GRUCTC(NeuralEncoder):
         lengths = batch.x_lens  # [B]
         day_indices = batch.day_id  # [B]
         
-        # PreNet: smoothing, patching, day adaptation, activation
+        # Smoother: temporal smoothing
+        x, lengths = self.smoother(x, lengths)
+        
+        # PreNet: day adaptation, activation, patching
         x, lengths = self.prenet(x, lengths, day_indices)
         
         # GRU backbone with packed sequences
-        x, hidden = self.backbone(x, lengths)
+        # Request intermediates if auxiliary head is enabled
+        x, hidden, intermediates = self.backbone(
+            x, lengths, 
+            return_intermediates=(self.aux_head is not None)
+        )
         
-        # Main CTC head
+        # Main CTC head (now handles masking internally)
         if self.training:
             # During training, don't apply temperature
             log_probs = self.ctc_head(x, lengths, temperature=1.0)
@@ -203,20 +202,21 @@ class GRUCTC(NeuralEncoder):
         
         # Prepare auxiliary outputs if using deep supervision
         aux_outputs = {}
-        if self.aux_head is not None and self._aux_features is not None:
-            # Get auxiliary predictions from intermediate layer
-            aux_logits = self.aux_head(self._aux_features)
-            
-            # Apply masking and log-softmax
-            mask_logits_(aux_logits, lengths)
-            aux_log_probs = F.log_softmax(aux_logits, dim=-1)
-            
-            aux_outputs['aux_log_probs'] = aux_log_probs
-            aux_outputs['aux_layer'] = self.aux_layer
-            aux_outputs['aux_weight'] = self.aux_weight
-            
-            # Clear stored features
-            self._aux_features = None
+        
+        if self.aux_head is not None and intermediates is not None:
+            # Get features from the specified intermediate layer
+            if self.aux_layer < len(intermediates):
+                aux_features = intermediates[self.aux_layer]
+                
+                # Get auxiliary predictions
+                aux_logits = self.aux_head(aux_features)
+                
+                # Apply masking and log-softmax
+                mask_logits_(aux_logits, lengths)
+                aux_log_probs = F.log_softmax(aux_logits, dim=-1)
+                
+                aux_outputs['aux_log_probs'] = aux_log_probs
+                aux_outputs['aux_layer'] = self.aux_layer
         
         # Add regularization loss if applicable
         if self.prenet.day_adapter is not None:
@@ -265,93 +265,49 @@ class GRUCTC(NeuralEncoder):
             Complete model configuration
         """
         config = super().export_config()
+        
+        # Smoother configuration
+        smoother_config = self.smoother.export_config() if hasattr(self.smoother, 'export_config') else {'type': 'unknown'}
+        
+        # PreNet detailed configuration
+        prenet_config = {
+            'activation': self.prenet.activation_name,
+            'patch_size': self.prenet.patch_size,
+            'patch_stride': self.prenet.patch_stride,
+        }
+        
+        # Day adapter configuration
+        if hasattr(self.prenet, 'day_adapter') and self.prenet.day_adapter is not None:
+            adapter = self.prenet.day_adapter
+            prenet_config['day_adapter'] = {
+                'grouping': adapter.grouping,
+                'l2_tether': adapter.l2_tether,
+                'l1_reg': adapter.l1_reg,
+                'num_groups': adapter.num_groups,
+                'group_size': adapter.group_size
+            }
+        else:
+            prenet_config['day_adapter'] = None
+        
         config.update({
             'input_dim': self.input_dim,
             'vocab_size': self.vocab_size,
             'num_days': self.num_days,
             'hidden_size': self.hidden_size,
             'num_layers': self.num_layers,
-            'prenet': {
-                'smoother': hasattr(self.prenet, 'smoother') and self.prenet.smoother is not None,
-                'patch_size': self.prenet.patch_size,
-                'patch_stride': self.prenet.patch_stride,
-                'day_adapter': hasattr(self.prenet, 'day_adapter') and self.prenet.day_adapter is not None,
-                'activation': str(self.prenet.activation)
+            'smoother': smoother_config,
+            'prenet': prenet_config,
+            'backbone': {
+                'type': 'gru',
+                'hidden_size': self.hidden_size,
+                'num_layers': self.num_layers,
+                'dropout': self.backbone.dropout,
+                'bidirectional': self.backbone.bidirectional,
+                'use_packed': self.backbone.use_packed,
+                'supports_aux': self.backbone.supports_aux()
             },
-            'aux_ctc': {
-                'enabled': self.aux_head is not None,
-                'layer': self.aux_layer,
-                'weight': self.aux_weight
-            },
+            'aux_layer': self.aux_layer,
             'temperature': self.calibrator.temperature.item(),
             'blank_idx': self.blank_idx
         })
         return config
-    
-    def get_intermediate_features(self, layer: int) -> Optional[torch.Tensor]:
-        """Get features from a specific GRU layer.
-        
-        Args:
-            layer: Layer index (0-based)
-            
-        Returns:
-            Features from specified layer if available
-        """
-        # This would require more sophisticated hook management
-        # For now, return None
-        return None
-    
-    def compute_ctc_loss(
-        self,
-        emissions: Emissions,
-        targets: torch.LongTensor,
-        target_lengths: torch.LongTensor
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute CTC loss with optional auxiliary loss.
-        
-        Args:
-            emissions: Model emissions
-            targets: Target phoneme sequences
-            target_lengths: Target sequence lengths
-            
-        Returns:
-            Tuple of (total_loss, loss_dict)
-        """
-        # Import CTC loss
-        from torch.nn import CTCLoss
-        ctc_criterion = CTCLoss(blank=self.blank_idx, reduction='mean', zero_infinity=True)
-        
-        # Main CTC loss
-        # Note: CTC expects [T, B, V] so we transpose
-        log_probs_transposed = emissions.log_probs.transpose(0, 1)
-        
-        main_loss = ctc_criterion(
-            log_probs_transposed,
-            targets,
-            emissions.out_lens,
-            target_lengths
-        )
-        
-        losses = {'ctc_loss': main_loss}
-        total_loss = main_loss
-        
-        # Add auxiliary CTC loss if available
-        if emissions.aux and 'aux_log_probs' in emissions.aux:
-            aux_log_probs = emissions.aux['aux_log_probs'].transpose(0, 1)
-            aux_loss = ctc_criterion(
-                aux_log_probs,
-                targets,
-                emissions.out_lens,
-                target_lengths
-            )
-            
-            losses['aux_ctc_loss'] = aux_loss
-            total_loss = total_loss + emissions.aux['aux_weight'] * aux_loss
-        
-        # Add FiLM regularization if available
-        if emissions.aux and 'film_reg_loss' in emissions.aux:
-            reg_loss = emissions.aux['film_reg_loss']
-            losses['film_reg_loss'] = reg_loss
-            total_loss = total_loss + reg_loss
-        
-        return total_loss, losses

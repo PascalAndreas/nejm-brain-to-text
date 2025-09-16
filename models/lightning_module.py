@@ -4,6 +4,7 @@ This module provides a Lightning wrapper for training with:
 - Exponential Moving Average (EMA) of weights with bias correction
 - Automatic mixed precision
 - Learning rate scheduling
+- Auxiliary loss scheduling
 - Comprehensive logging with Weights & Biases
 - Validation metrics
 """
@@ -13,7 +14,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 import pytorch_lightning as pl
 from torchmetrics import Accuracy, CharErrorRate, WordErrorRate
 import numpy as np
@@ -22,6 +22,7 @@ from copy import deepcopy
 from .base import Batch, Emissions, NeuralEncoder
 from .gru_ctc import GRUCTC
 from . import build_encoder
+from .schedulers import build_lr_scheduler, build_aux_scheduler, AuxiliaryLossScheduler
 
 
 class EMA:
@@ -160,6 +161,7 @@ class BrainToTextLightningModule(pl.LightningModule):
         model_config: Configuration for the neural encoder
         optimizer_config: Configuration for optimizer
         scheduler_config: Configuration for learning rate scheduler
+        aux_loss_config: Configuration for auxiliary loss
         training_config: Additional training configuration
         use_ema: Whether to use EMA of weights
         ema_decay: Base EMA decay rate
@@ -172,6 +174,7 @@ class BrainToTextLightningModule(pl.LightningModule):
         model_config: Dict[str, Any],
         optimizer_config: Optional[Dict[str, Any]] = None,
         scheduler_config: Optional[Dict[str, Any]] = None,
+        aux_loss_config: Optional[Dict[str, Any]] = None,
         training_config: Optional[Dict[str, Any]] = None,
         use_ema: bool = True,
         ema_decay: float = 0.999,
@@ -198,6 +201,8 @@ class BrainToTextLightningModule(pl.LightningModule):
             'min_lr': 1e-6
         }
         
+        self.aux_loss_config = aux_loss_config or {}
+        
         self.training_config = training_config or {
             'gradient_clip_val': 1.0,
             'accumulate_grad_batches': 1,
@@ -205,14 +210,24 @@ class BrainToTextLightningModule(pl.LightningModule):
             'log_every_n_steps': 100
         }
         
+        # Extract auxiliary layer from model config if present
+        if 'aux_layer' in model_config:
+            aux_layer = model_config.pop('aux_layer')
+        else:
+            aux_layer = self.aux_loss_config.get('layer', None)
+        
         # Create model
         if 'name' in model_config:
+            # Add aux_layer to params if needed
+            params = model_config.get('params', {})
+            params['aux_layer'] = aux_layer
             self.model = build_encoder(
                 model_config['name'],
-                model_config.get('params', {})
+                params
             )
         else:
             # Default to GRU-CTC
+            model_config['aux_layer'] = aux_layer
             self.model = GRUCTC(**model_config)
         
         # EMA setup with bias correction
@@ -226,6 +241,9 @@ class BrainToTextLightningModule(pl.LightningModule):
                 warmup_steps=ema_warmup_steps,
                 device=self.device
             )
+        
+        # Auxiliary loss scheduler
+        self.aux_scheduler = build_aux_scheduler(self.aux_loss_config)
         
         # Loss function
         self.ctc_loss = nn.CTCLoss(
@@ -306,8 +324,16 @@ class BrainToTextLightningModule(pl.LightningModule):
                 emissions.out_lens,
                 batch.y_lens
             )
+            
+            # Get weight from scheduler
+            if self.aux_scheduler is not None:
+                aux_weight = self.aux_scheduler.get_weight(self.global_step)
+            else:
+                aux_weight = 0.0
+            
             losses['aux_ctc_loss'] = aux_loss
-            total_loss = total_loss + emissions.aux['aux_weight'] * aux_loss
+            losses['aux_weight'] = torch.tensor(aux_weight)
+            total_loss = total_loss + aux_weight * aux_loss
         
         # FiLM regularization loss
         if emissions.aux and 'film_reg_loss' in emissions.aux:
@@ -351,6 +377,10 @@ class BrainToTextLightningModule(pl.LightningModule):
                     ema_stats = self.ema.get_stats()
                     for key, value in ema_stats.items():
                         self.log(f'train/{key}', value)
+        
+        # Step auxiliary scheduler if present
+        if self.aux_scheduler is not None:
+            self.aux_scheduler.step()
         
         return loss
     
@@ -499,24 +529,8 @@ class BrainToTextLightningModule(pl.LightningModule):
             eps=self.optimizer_config.get('eps', 1e-8)
         )
         
-        # Create scheduler
-        scheduler_type = self.scheduler_config.get('type', 'cosine')
-        
-        if scheduler_type == 'cosine':
-            scheduler = CosineAnnealingLR(
-                optimizer,
-                T_max=self.scheduler_config.get('T_max', 100000),
-                eta_min=self.scheduler_config.get('min_lr', 1e-6)
-            )
-        elif scheduler_type == 'onecycle':
-            scheduler = OneCycleLR(
-                optimizer,
-                max_lr=self.scheduler_config.get('max_lr', 3e-4),
-                total_steps=self.scheduler_config.get('total_steps', 100000),
-                pct_start=self.scheduler_config.get('pct_start', 0.1)
-            )
-        else:
-            raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+        # Create learning rate scheduler
+        scheduler = build_lr_scheduler(optimizer, self.scheduler_config)
         
         return {
             'optimizer': optimizer,
@@ -528,16 +542,19 @@ class BrainToTextLightningModule(pl.LightningModule):
         }
     
     def on_save_checkpoint(self, checkpoint: Dict) -> None:
-        """Save EMA state in checkpoint.
+        """Save EMA and auxiliary scheduler state in checkpoint.
         
         Args:
             checkpoint: Checkpoint dictionary
         """
         if self.use_ema and self.ema is not None:
             checkpoint['ema_state'] = self.ema.state_dict()
+        
+        if self.aux_scheduler is not None:
+            checkpoint['aux_scheduler_state'] = self.aux_scheduler.state_dict()
     
     def on_load_checkpoint(self, checkpoint: Dict) -> None:
-        """Load EMA state from checkpoint.
+        """Load EMA and auxiliary scheduler state from checkpoint.
         
         Args:
             checkpoint: Checkpoint dictionary
@@ -551,3 +568,6 @@ class BrainToTextLightningModule(pl.LightningModule):
                     warmup_steps=self.hparams.get('ema_warmup_steps', 10)
                 )
             self.ema.load_state_dict(checkpoint['ema_state'])
+        
+        if self.aux_scheduler is not None and 'aux_scheduler_state' in checkpoint:
+            self.aux_scheduler.load_state_dict(checkpoint['aux_scheduler_state'])

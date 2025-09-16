@@ -185,6 +185,7 @@ def main(args):
         model_config=config['model']['params'],
         optimizer_config=config['training'].get('optimizer'),
         scheduler_config=config['training'].get('scheduler'),
+        aux_loss_config=config['training'].get('aux_loss'),
         training_config=config['training'],
         use_ema=config['training'].get('use_ema', True),
         ema_decay=config['training'].get('ema_decay', 0.999),

@@ -1,7 +1,7 @@
 """Pre-processing network components for neural encoder models.
 
 This module contains preprocessing blocks that are applied to raw neural
-signals before the main encoder backbone.
+signals before the main encoder backbone (excluding smoothing).
 """
 
 from typing import Optional, Literal, Tuple, Dict, Any, List
@@ -10,203 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from .utils import apply_patch_embedding, compute_output_lengths, get_activation_fn
-
-
-class DepthwiseCausalSmoother(nn.Module):
-    """Learnable depthwise causal convolution for temporal smoothing.
-    
-    Applies causal 1D convolution independently per feature channel with
-    learnable kernels constrained to be valid smoothing filters (sum to 1).
-    Uses softmax parameterization for numerically stable normalization.
-    
-    Args:
-        num_features: Number of input feature channels
-        kernel_size: Size of convolution kernel (should be odd)
-        residual_gate: If True, use gated residual connection y = (1-α)x + α·conv(x)
-        init_std: Standard deviation for Gaussian initialization (in frames)
-    """
-    
-    def __init__(
-        self,
-        num_features: int,
-        kernel_size: int = 11,
-        residual_gate: bool = True,
-        init_std: float = 2.0
-    ):
-        super().__init__()
-        
-        self.num_features = num_features
-        self.kernel_size = kernel_size
-        self.residual_gate = residual_gate
-        
-        # Learnable kernel parameters (log-space, transformed with softmax)
-        self.kernel_params = nn.Parameter(
-            torch.zeros(num_features, 1, kernel_size)
-        )
-        
-        # Initialize to exact Gaussian
-        self._init_gaussian_kernel(init_std)
-        
-        # Residual gate parameters
-        if residual_gate:
-            # Gate parameter α (will be transformed with sigmoid)
-            self.gate_param = nn.Parameter(torch.full((1,), -1.386))  # sigmoid(-1.386) ≈ 0.2
-        
-        # No bias in convolution
-        self.padding = kernel_size - 1  # For causal padding
-    
-    def _init_gaussian_kernel(self, std: float):
-        """Initialize kernel parameters to exact Gaussian."""
-        with torch.no_grad():
-            # Create causal Gaussian kernel
-            positions = torch.arange(self.kernel_size, dtype=torch.float32)
-            positions = self.kernel_size - 1 - positions  # Reverse for causality
-            
-            # Gaussian values (normalized to sum=1)
-            gaussian = torch.exp(-(positions ** 2) / (2 * std ** 2))
-            gaussian = gaussian / gaussian.sum()
-            
-            # For softmax parameterization: φ = log(h + ε)
-            # This ensures softmax(φ) = h exactly
-            eps = 1e-8
-            log_gaussian = torch.log(gaussian + eps)
-            
-            # Set for all features
-            self.kernel_params.data = log_gaussian.unsqueeze(0).unsqueeze(0).expand_as(self.kernel_params)
-    
-    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-        """Apply depthwise causal smoothing.
-        
-        Args:
-            x: Input tensor [B, T, F]
-            
-        Returns:
-            Smoothed tensor [B, T, F]
-        """
-        batch_size, seq_len, feat_dim = x.shape
-        
-        # Transform kernel parameters to valid weights using softmax
-        # This ensures weights ≥ 0 and sum = 1 by construction
-        kernel_weights = F.softmax(self.kernel_params, dim=-1)  # [F, 1, K]
-        
-        # Reshape for depthwise convolution: [B, F, T]
-        x_conv = x.transpose(1, 2)
-        
-        # Apply causal padding (left padding = kernel_size - 1)
-        x_padded = F.pad(x_conv, (self.padding, 0), mode='constant', value=0)
-        
-        # Depthwise convolution
-        x_smoothed = F.conv1d(
-            x_padded,
-            kernel_weights,
-            groups=feat_dim,
-            stride=1
-        )
-        
-        # Restore shape: [B, T, F]
-        x_smoothed = x_smoothed.transpose(1, 2)
-        
-        # Apply residual gate if enabled: y = (1-α)x + α·conv(x)
-        if self.residual_gate:
-            alpha = torch.sigmoid(self.gate_param)
-            x_smoothed = (1 - alpha) * x + alpha * x_smoothed
-        
-        return x_smoothed
-    
-    def get_effective_kernels(self) -> torch.Tensor:
-        """Get the effective smoothing kernels after softmax normalization.
-        
-        Returns:
-            Normalized kernel weights [F, K]
-        """
-        with torch.no_grad():
-            weights = F.softmax(self.kernel_params, dim=-1).squeeze(1)  # [F, K]
-        return weights
-    
-    def extra_repr(self) -> str:
-        return f'num_features={self.num_features}, kernel_size={self.kernel_size}, residual_gate={self.residual_gate}'
-
-
-class GaussianSmoother(nn.Module):
-    """Fixed Gaussian smoothing for temporal signals (legacy).
-    
-    Applies 1D Gaussian smoothing along the time dimension independently
-    for each feature channel. This is implemented as a depthwise convolution
-    with fixed Gaussian weights.
-    
-    Args:
-        kernel_size: Size of the Gaussian kernel (should be odd)
-        std: Standard deviation of the Gaussian
-        trainable: If True, kernel parameters are trainable
-    """
-    
-    def __init__(
-        self,
-        kernel_size: int = 100,
-        std: float = 2.0,
-        trainable: bool = False
-    ):
-        super().__init__()
-        
-        if kernel_size % 2 == 0:
-            kernel_size += 1  # Ensure odd kernel size
-            
-        self.kernel_size = kernel_size
-        self.std = std
-        self.trainable = trainable
-        
-        # Create Gaussian kernel
-        kernel = self._create_gaussian_kernel(kernel_size, std)
-        
-        if trainable:
-            self.kernel = nn.Parameter(kernel)
-        else:
-            self.register_buffer('kernel', kernel)
-    
-    def _create_gaussian_kernel(self, size: int, std: float) -> torch.Tensor:
-        """Create 1D Gaussian kernel."""
-        coords = torch.arange(size, dtype=torch.float32)
-        coords -= (size - 1) / 2.0
-        
-        kernel = torch.exp(-(coords ** 2) / (2 * std ** 2))
-        kernel = kernel / kernel.sum()
-        
-        return kernel
-    
-    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-        """Apply Gaussian smoothing.
-        
-        Args:
-            x: Input tensor [B, T, F]
-            
-        Returns:
-            Smoothed tensor [B, T, F]
-        """
-        batch_size, seq_len, feat_dim = x.shape
-        
-        # Reshape for depthwise convolution: [B, F, T]
-        x = x.transpose(1, 2)
-        
-        # Expand kernel for all feature channels: [F, 1, kernel_size]
-        kernel = self.kernel.unsqueeze(0).unsqueeze(0)
-        kernel = kernel.expand(feat_dim, 1, -1)
-        
-        # Apply depthwise convolution with same padding
-        padding = self.kernel_size // 2
-        x_smoothed = F.conv1d(
-            x,
-            kernel,
-            groups=feat_dim,
-            padding=padding
-        )
-        
-        # Restore shape: [B, T, F]
-        x_smoothed = x_smoothed.transpose(1, 2)
-        
-        return x_smoothed
-    
-    def extra_repr(self) -> str:
-        return f'kernel_size={self.kernel_size}, std={self.std}, trainable={self.trainable}'
 
 
 class DayAdapter(nn.Module):
@@ -357,48 +160,29 @@ class DayAdapter(nn.Module):
 class PreNet(nn.Module):
     """Complete preprocessing network combining multiple components.
     
-    This module chains together smoothing, day adaptation, activation,
-    and patching operations.
+    This module chains together day adaptation, activation,
+    and patching operations. Smoothing is now handled separately.
     
     Args:
         input_dim: Number of input features
         num_days: Number of recording days
-        smoother_config: Configuration for smoother (Gaussian or Depthwise)
         day_adapter_config: Configuration for day adapter
         patch_config: Configuration for patching
         activation: Activation function name
-        use_depthwise_smoother: If True, use learnable depthwise smoother
     """
     
     def __init__(
         self,
         input_dim: int,
         num_days: int,
-        smoother_config: Optional[Dict[str, Any]] = None,
         day_adapter_config: Optional[Dict[str, Any]] = None,
         patch_config: Optional[Dict[str, Any]] = None,
-        activation: str = 'softsign',
-        use_depthwise_smoother: bool = True
+        activation: str = 'softsign'
     ):
         super().__init__()
         
         self.input_dim = input_dim
         self.output_dim = input_dim  # Will be updated if patching is used
-        
-        # Smoother (depthwise causal or Gaussian)
-        self.smoother = None
-        if smoother_config is not None:
-            if use_depthwise_smoother:
-                # Use learnable depthwise causal smoother
-                self.smoother = DepthwiseCausalSmoother(
-                    num_features=input_dim,
-                    kernel_size=smoother_config.get('kernel_size', 11),
-                    residual_gate=smoother_config.get('residual_gate', True),
-                    init_std=smoother_config.get('std', 2.0)
-                )
-            else:
-                # Use fixed Gaussian smoother (legacy)
-                self.smoother = GaussianSmoother(**smoother_config)
         
         # Patching configuration
         self.patch_config = patch_config or {}
@@ -429,6 +213,8 @@ class PreNet(nn.Module):
     ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
         """Apply preprocessing to input features.
         
+        Note: Smoothing is now handled separately before PreNet.
+        
         Args:
             x: Input tensor [B, T, F]
             lengths: Sequence lengths [B]
@@ -439,10 +225,6 @@ class PreNet(nn.Module):
             - Processed tensor [B, T_out, F_out]
             - Updated lengths [B]
         """
-        # Smoothing (depthwise causal or Gaussian)
-        if self.smoother is not None:
-            x = self.smoother(x)
-        
         # Day-specific adaptation
         if self.day_adapter is not None and day_indices is not None:
             x = self.day_adapter(x, day_indices)
@@ -487,8 +269,6 @@ class PreNet(nn.Module):
     
     def extra_repr(self) -> str:
         parts = []
-        if self.smoother:
-            parts.append(f'smoother={self.smoother.__class__.__name__}')
         if self.patch_size > 1:
             parts.append(f'patch_size={self.patch_size}, patch_stride={self.patch_stride}')
         if self.day_adapter:

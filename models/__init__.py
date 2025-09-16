@@ -7,6 +7,13 @@ neural implant data to phoneme predictions using CTC loss.
 from typing import Dict, Optional
 from .base import Batch, Emissions, NeuralEncoder
 from .gru_ctc import GRUCTC
+from .lightning_module import BrainToTextLightningModule, EMA
+from .schedulers import (
+    build_lr_scheduler,
+    build_aux_scheduler,
+    AuxiliaryLossScheduler,
+    WarmupCosineScheduler
+)
 
 # Model registry for easy model selection
 ENCODERS: Dict[str, type] = {
@@ -40,6 +47,12 @@ __all__ = [
     "Emissions", 
     "NeuralEncoder",
     "GRUCTC",
+    "BrainToTextLightningModule",
+    "EMA",
     "build_encoder",
+    "build_lr_scheduler",
+    "build_aux_scheduler",
+    "AuxiliaryLossScheduler",
+    "WarmupCosineScheduler",
     "ENCODERS"
 ]
