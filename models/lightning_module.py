@@ -1,10 +1,10 @@
 """PyTorch Lightning module for training neural encoder models.
 
 This module provides a Lightning wrapper for training with:
-- Exponential Moving Average (EMA) of weights
+- Exponential Moving Average (EMA) of weights with bias correction
 - Automatic mixed precision
 - Learning rate scheduling
-- Comprehensive logging
+- Comprehensive logging with Weights & Biases
 - Validation metrics
 """
 
@@ -25,14 +25,17 @@ from . import build_encoder
 
 
 class EMA:
-    """Exponential Moving Average of model parameters.
+    """Exponential Moving Average of model parameters with bias correction.
     
     This class maintains a moving average of model parameters which often
-    provides better generalization than the raw trained weights.
+    provides better generalization than the raw trained weights. Includes
+    bias correction and adaptive update scheduling.
     
     Args:
         model: The model to track
-        decay: EMA decay rate (e.g., 0.999)
+        decay: Base EMA decay rate (e.g., 0.999)
+        use_bias_correction: Whether to use bias correction
+        warmup_steps: Number of warmup steps for bias correction
         device: Device for EMA parameters
     """
     
@@ -40,11 +43,16 @@ class EMA:
         self,
         model: nn.Module,
         decay: float = 0.999,
+        use_bias_correction: bool = True,
+        warmup_steps: int = 10,
         device: str = 'cpu'
     ):
         self.model = model
-        self.decay = decay
+        self.base_decay = decay
+        self.use_bias_correction = use_bias_correction
+        self.warmup_steps = warmup_steps
         self.device = device
+        self.updates = 0
         
         # Create EMA parameters
         self.shadow = {}
@@ -55,15 +63,50 @@ class EMA:
             if param.requires_grad:
                 self.shadow[name] = param.data.clone().to(device)
     
+    def get_decay(self) -> float:
+        """Get effective decay rate with bias correction.
+        
+        Returns:
+            Effective decay rate
+        """
+        if self.use_bias_correction:
+            # Bias-corrected decay that starts low and increases to base_decay
+            effective_decay = min(
+                self.base_decay,
+                (1 + self.updates) / (self.warmup_steps + self.updates)
+            )
+            return effective_decay
+        return self.base_decay
+    
     @torch.no_grad()
     def update(self):
-        """Update EMA parameters."""
+        """Update EMA parameters with current model weights."""
+        decay = self.get_decay()
+        
         for name, param in self.model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.shadow[name] = (
-                    self.decay * self.shadow[name] +
-                    (1.0 - self.decay) * param.data
+                    decay * self.shadow[name] +
+                    (1.0 - decay) * param.data
                 )
+        
+        self.updates += 1
+    
+    def should_update(self, step: int) -> bool:
+        """Determine if EMA should be updated at this step.
+        
+        Uses adaptive scheduling: more frequent updates early in training,
+        less frequent later.
+        
+        Args:
+            step: Current training step
+            
+        Returns:
+            True if EMA should be updated
+        """
+        # More frequent early (every step), less frequent later (every 50 steps)
+        update_freq = min(50, max(1, step // 1000))
+        return step % update_freq == 0
     
     def apply_shadow(self):
         """Apply EMA parameters to model (for evaluation)."""
@@ -81,12 +124,33 @@ class EMA:
     
     def state_dict(self) -> Dict:
         """Get EMA state for checkpointing."""
-        return {'shadow': self.shadow, 'decay': self.decay}
+        return {
+            'shadow': self.shadow,
+            'base_decay': self.base_decay,
+            'updates': self.updates,
+            'use_bias_correction': self.use_bias_correction,
+            'warmup_steps': self.warmup_steps
+        }
     
     def load_state_dict(self, state_dict: Dict):
         """Load EMA state from checkpoint."""
         self.shadow = state_dict['shadow']
-        self.decay = state_dict.get('decay', self.decay)
+        self.base_decay = state_dict.get('base_decay', self.base_decay)
+        self.updates = state_dict.get('updates', 0)
+        self.use_bias_correction = state_dict.get('use_bias_correction', True)
+        self.warmup_steps = state_dict.get('warmup_steps', 10)
+    
+    def get_stats(self) -> Dict[str, float]:
+        """Get EMA statistics for logging.
+        
+        Returns:
+            Dictionary with EMA stats
+        """
+        return {
+            'ema_decay': self.get_decay(),
+            'ema_updates': self.updates,
+            'ema_update_freq': min(50, max(1, self.updates // 1000))
+        }
 
 
 class BrainToTextLightningModule(pl.LightningModule):
@@ -98,7 +162,9 @@ class BrainToTextLightningModule(pl.LightningModule):
         scheduler_config: Configuration for learning rate scheduler
         training_config: Additional training configuration
         use_ema: Whether to use EMA of weights
-        ema_decay: EMA decay rate
+        ema_decay: Base EMA decay rate
+        ema_bias_correction: Whether to use bias correction for EMA
+        ema_warmup_steps: Number of warmup steps for EMA bias correction
     """
     
     def __init__(
@@ -108,7 +174,9 @@ class BrainToTextLightningModule(pl.LightningModule):
         scheduler_config: Optional[Dict[str, Any]] = None,
         training_config: Optional[Dict[str, Any]] = None,
         use_ema: bool = True,
-        ema_decay: float = 0.999
+        ema_decay: float = 0.999,
+        ema_bias_correction: bool = True,
+        ema_warmup_steps: int = 10
     ):
         super().__init__()
         
@@ -147,11 +215,17 @@ class BrainToTextLightningModule(pl.LightningModule):
             # Default to GRU-CTC
             self.model = GRUCTC(**model_config)
         
-        # EMA setup
+        # EMA setup with bias correction
         self.use_ema = use_ema
         self.ema = None
         if use_ema:
-            self.ema = EMA(self.model, decay=ema_decay, device=self.device)
+            self.ema = EMA(
+                self.model,
+                decay=ema_decay,
+                use_bias_correction=ema_bias_correction,
+                warmup_steps=ema_warmup_steps,
+                device=self.device
+            )
         
         # Loss function
         self.ctc_loss = nn.CTCLoss(
@@ -267,9 +341,16 @@ class BrainToTextLightningModule(pl.LightningModule):
         for key, value in loss_dict.items():
             self.log(f'train/{key}', value, on_step=True, on_epoch=True, prog_bar=(key == 'total_loss'))
         
-        # Update EMA after optimizer step
+        # Update EMA with adaptive scheduling
         if self.use_ema and self.ema is not None:
-            self.ema.update()
+            if self.ema.should_update(self.global_step):
+                self.ema.update()
+                
+                # Log EMA stats periodically
+                if self.global_step % 100 == 0:
+                    ema_stats = self.ema.get_stats()
+                    for key, value in ema_stats.items():
+                        self.log(f'train/{key}', value)
         
         return loss
     
@@ -463,5 +544,10 @@ class BrainToTextLightningModule(pl.LightningModule):
         """
         if self.use_ema and 'ema_state' in checkpoint:
             if self.ema is None:
-                self.ema = EMA(self.model, decay=self.hparams.ema_decay)
+                self.ema = EMA(
+                    self.model,
+                    decay=self.hparams.ema_decay,
+                    use_bias_correction=self.hparams.get('ema_bias_correction', True),
+                    warmup_steps=self.hparams.get('ema_warmup_steps', 10)
+                )
             self.ema.load_state_dict(checkpoint['ema_state'])

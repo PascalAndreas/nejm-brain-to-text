@@ -36,11 +36,14 @@ model:
     
     # PreNet configuration
     prenet_config:
-      # Gaussian smoothing
+      # Use learnable depthwise causal smoother
+      use_depthwise_smoother: true
+      
+      # Smoother configuration
       smoother_config:
-        kernel_size: 100
-        std: 2.0
-        trainable: false
+        kernel_size: 11  # Smaller kernel for causal conv
+        std: 2.0  # For initialization
+        residual_gate: true  # Gated residual connection
       
       # Day-specific adaptation (FiLM)
       day_adapter_config:
@@ -91,9 +94,11 @@ training:
   # Mixed precision training
   precision: 16  # Use 16-bit precision for faster training
   
-  # EMA configuration
+  # EMA configuration with bias correction
   use_ema: true
   ema_decay: 0.999
+  ema_bias_correction: true  # Use bias-corrected EMA
+  ema_warmup_steps: 10  # Warmup steps for bias correction
   
   # Data augmentation
   augmentation:
@@ -156,7 +161,7 @@ checkpointing:
   
 # Logging configuration
 logging:
-  logger: wandb  # 'wandb' or 'tensorboard'
+  logger: wandb  # Using Weights & Biases for experiment tracking
   project: brain-to-text
   name: gru_ctc_baseline
   save_dir: logs
@@ -184,11 +189,12 @@ experiment:
   
   # Notes
   notes: |
-    Baseline GRU-CTC model with:
-    - Gaussian smoothing (kernel=100, std=2)
-    - Patching (size=4, stride=2)
-    - FiLM day adaptation with identity init
-    - 5-layer GRU with 768 hidden units
-    - Auxiliary CTC at layer 3
-    - EMA of weights (decay=0.999)
+    Improved GRU-CTC model with:
+    - Learnable depthwise causal smoothing (kernel=11, residual gate)
+    - Patching (size=4, stride=2) for length reduction
+    - FiLM day adaptation with identity init and L2 tethering
+    - 5-layer GRU with 768 hidden units and packed sequences
+    - Auxiliary CTC at layer 3 for deep supervision
+    - Bias-corrected EMA with adaptive update schedule
     - Temperature calibration on validation set
+    - Weights & Biases logging for experiment tracking

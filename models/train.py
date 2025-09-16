@@ -21,7 +21,7 @@ from pytorch_lightning.callbacks import (
     RichProgressBar,
     RichModelSummary
 )
-from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
 # Add parent directory to path
@@ -134,32 +134,24 @@ def create_callbacks(config: Dict[str, Any]) -> list:
 
 
 def create_logger(config: Dict[str, Any]):
-    """Create logger for experiment tracking.
+    """Create Weights & Biases logger for experiment tracking.
     
     Args:
         config: Configuration dictionary
         
     Returns:
-        Logger instance
+        WandbLogger instance
     """
     logging_config = config.get('logging', {})
     
-    if logging_config.get('logger') == 'wandb':
-        logger = WandbLogger(
-            project=logging_config.get('project', 'brain-to-text'),
-            name=logging_config.get('name', 'experiment'),
-            save_dir=logging_config.get('save_dir', 'logs'),
-            log_model=logging_config.get('log_model', False),
-            tags=config.get('experiment', {}).get('tags'),
-            notes=config.get('experiment', {}).get('notes')
-        )
-    elif logging_config.get('logger') == 'tensorboard':
-        logger = TensorBoardLogger(
-            save_dir=logging_config.get('save_dir', 'logs'),
-            name=logging_config.get('name', 'experiment')
-        )
-    else:
-        logger = None
+    logger = WandbLogger(
+        project=logging_config.get('project', 'brain-to-text'),
+        name=logging_config.get('name', 'experiment'),
+        save_dir=logging_config.get('save_dir', 'logs'),
+        log_model=logging_config.get('log_model', False),
+        tags=config.get('experiment', {}).get('tags'),
+        notes=config.get('experiment', {}).get('notes')
+    )
     
     return logger
 
@@ -195,7 +187,9 @@ def main(args):
         scheduler_config=config['training'].get('scheduler'),
         training_config=config['training'],
         use_ema=config['training'].get('use_ema', True),
-        ema_decay=config['training'].get('ema_decay', 0.999)
+        ema_decay=config['training'].get('ema_decay', 0.999),
+        ema_bias_correction=config['training'].get('ema_bias_correction', True),
+        ema_warmup_steps=config['training'].get('ema_warmup_steps', 10)
     )
     
     # Create callbacks

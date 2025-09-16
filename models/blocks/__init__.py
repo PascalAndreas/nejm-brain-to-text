@@ -4,7 +4,7 @@ This module provides reusable components that can be composed to create
 various neural encoder architectures.
 """
 
-from .prenet import GaussianSmoother, DayAdapter, PreNet
+from .prenet import GaussianSmoother, DepthwiseCausalSmoother, DayAdapter, PreNet
 from .rnn import GRUBackbone, LSTMBackbone, VariationalGRU
 from .head import ProjectionHead, AuxiliaryHead, MultiHeadProjection, CTCHead
 from .calibrator import TemperatureScaling, PlattScaling, EnsembleTemperature
@@ -21,6 +21,7 @@ from .utils import (
 __all__ = [
     # PreNet components
     "GaussianSmoother",
+    "DepthwiseCausalSmoother",
     "DayAdapter", 
     "PreNet",
     

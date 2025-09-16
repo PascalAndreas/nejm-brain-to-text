@@ -69,10 +69,11 @@ class GRUCTC(NeuralEncoder):
         # Default PreNet configuration
         if prenet_config is None:
             prenet_config = {
+                'use_depthwise_smoother': True,  # Use learnable causal smoother
                 'smoother_config': {
-                    'kernel_size': 100,
-                    'std': 2.0,
-                    'trainable': False
+                    'kernel_size': 11,  # Smaller kernel for causal conv
+                    'std': 2.0,  # For initialization
+                    'residual_gate': True  # Gated residual
                 },
                 'day_adapter_config': {
                     'grouping': 'blocks8',
