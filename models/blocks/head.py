@@ -6,6 +6,7 @@ CTC heads for deep supervision.
 """
 
 from typing import Optional, Tuple, Dict, Any, Union
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +22,8 @@ class ProjectionHead(nn.Module):
         vocab_size: Size of output vocabulary (including CTC blank)
         dropout: Dropout probability before projection
         bias: If True, use bias in linear layer
-        init_scale: Scale factor for weight initialization
+        init_scale: Scale factor for weight initialization (σ = init_scale/√H)
+                   where H is input_size. Default 1.0 gives fan-in scaling.
     """
     
     def __init__(
@@ -44,10 +46,12 @@ class ProjectionHead(nn.Module):
         # Linear projection
         self.projection = nn.Linear(input_size, vocab_size, bias=bias)
         
-        # Initialize weights
-        nn.init.xavier_uniform_(self.projection.weight, gain=init_scale)
-        if bias:
-            nn.init.zeros_(self.projection.bias)
+        # Initialize weights for CTC stability
+        # Use fan-in std (~1/√H) instead of xavier for better CTC convergence
+        with torch.no_grad():
+            nn.init.normal_(self.projection.weight, mean=0.0, std=(init_scale / math.sqrt(self.input_size)))
+            if bias:
+                nn.init.zeros_(self.projection.bias)
     
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
         """Project hidden states to vocabulary logits.
@@ -118,10 +122,12 @@ class AuxiliaryHead(nn.Module):
         
         self.projection = nn.Sequential(*layers)
         
-        # Initialize final projection
-        if hidden_size is not None:
-            nn.init.xavier_uniform_(self.projection[-1].weight)
-            nn.init.zeros_(self.projection[-1].bias)
+        # Initialize all linear layers
+        for m in self.projection:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
         """Project intermediate representations to vocabulary logits.
@@ -228,7 +234,10 @@ class MultiHeadProjection(nn.Module):
             Uncertainty scores [B, T]
         """
         all_logits = torch.stack([head(x) for head in self.heads])
-        all_probs = F.softmax(all_logits, dim=-1)
+        
+        # Use float32 for numerical stability in mixed precision
+        all_logits_32 = all_logits.float()
+        all_probs = F.softmax(all_logits_32, dim=-1)
         
         # Compute variance across heads
         mean_probs = all_probs.mean(dim=0)
@@ -237,7 +246,8 @@ class MultiHeadProjection(nn.Module):
         # Average variance across vocabulary dimension
         uncertainty = variance.mean(dim=-1)
         
-        return uncertainty
+        # Convert back to original dtype
+        return uncertainty.to(all_logits.dtype)
 
 
 class CTCHead(nn.Module):
@@ -264,6 +274,7 @@ class CTCHead(nn.Module):
         self.input_size = input_size
         self.vocab_size = vocab_size
         self.blank_idx = blank_idx
+        self.dropout_rate = dropout
         
         # Projection head
         self.projection = ProjectionHead(input_size, vocab_size, dropout=dropout)
@@ -293,24 +304,44 @@ class CTCHead(nn.Module):
         if temperature != 1.0:
             logits = logits / temperature
         
-        # CRITICAL: Mask invalid positions BEFORE log_softmax
-        # This ensures padded positions don't affect the normalization
+        # Safe masking: force blank on padded frames to avoid NaNs
         if lengths is not None:
-            from .utils import mask_logits_
-            mask_logits_(logits, lengths)
+            from .utils import force_blank_on_pad_
+            force_blank_on_pad_(logits, lengths, self.blank_idx)
         
         # Compute log probabilities
         log_probs = F.log_softmax(logits, dim=-1)
         
         return log_probs
     
-    def get_logits(self, x: torch.FloatTensor) -> torch.FloatTensor:
+    def get_logits(
+        self,
+        x: torch.FloatTensor,
+        lengths: Optional[torch.LongTensor] = None,
+        mask_pad: bool = False
+    ) -> torch.FloatTensor:
         """Get raw logits without log-softmax.
         
         Args:
             x: Input tensor [B, T, H]
+            lengths: Sequence lengths for masking [B]
+            mask_pad: If True, apply safe padding mask to logits
             
         Returns:
             Logits tensor [B, T, V]
         """
-        return self.projection(x)
+        logits = self.projection(x)
+        
+        # Optional safe masking for decoding
+        if mask_pad and lengths is not None:
+            from .utils import force_blank_on_pad_
+            force_blank_on_pad_(logits, lengths, self.blank_idx)
+        
+        return logits
+    
+    def extra_repr(self) -> str:
+        return (f'input_size={self.input_size}, vocab_size={self.vocab_size}, '
+                f'blank_idx={self.blank_idx}')
+    
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}({self.extra_repr()})'

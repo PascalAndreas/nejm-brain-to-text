@@ -11,6 +11,26 @@ import math
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
 
 
+def time_mask_like(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Return a [B,T,1] mask with 1 on valid frames, 0 on padded tail.
+    
+    Args:
+        x: Input tensor [B, T, F]
+        lengths: Valid lengths for each sequence [B]
+        
+    Returns:
+        Time mask [B, T, 1] with 1 for valid frames, 0 for padding
+    """
+    B, T = x.size(0), x.size(1)
+    if lengths is None:
+        return x.new_ones((B, T, 1))
+    if lengths.device != x.device:
+        lengths = lengths.to(x.device)
+    t = torch.arange(T, device=x.device).unsqueeze(0)         # [1,T]
+    m = (t < lengths.unsqueeze(1)).unsqueeze(-1).to(x.dtype)  # [B,T,1]
+    return m
+
+
 
 
 def mask_logits_(
@@ -41,6 +61,44 @@ def mask_logits_(
     logits.masked_fill_(mask.unsqueeze(-1), mask_value)
 
 
+def force_blank_on_pad_(
+    logits: torch.Tensor,
+    lengths: torch.LongTensor,
+    blank_idx: int
+) -> None:
+    """Force blank token on padded frames to avoid NaNs in log_softmax.
+    
+    For t >= length[b], set logits[b, t, blank] = 0 and others = very negative.
+    This avoids NaNs in log_softmax and yields near-1.0 blank prob on padded frames.
+    
+    Args:
+        logits: Logit tensor to modify in-place [B, T, V]
+        lengths: Valid lengths for each sequence [B]
+        blank_idx: Index of the CTC blank token
+        
+    Note:
+        This function modifies logits in-place for efficiency.
+    """
+    B, T, V = logits.shape
+    device = logits.device
+    if lengths.device != device:
+        lengths = lengths.to(device)
+    
+    # Build time mask [B, T, 1] - True where padded
+    t = torch.arange(T, device=device).view(1, T)
+    mask = (t >= lengths.view(B, 1)).unsqueeze(-1)  # [B, T, 1]
+    
+    if mask.any():
+        # Use a large negative value, but not -inf to avoid NaNs
+        very_neg = torch.finfo(logits.dtype).min / 2
+        
+        # Set all classes to very_neg at padded frames
+        logits.masked_fill_(mask.expand(-1, -1, V), very_neg)
+        
+        # Set blank to 0 at padded frames
+        logits[..., blank_idx].masked_fill_(mask.squeeze(-1), 0.0)
+
+
 def create_padding_mask(
     lengths: torch.LongTensor,
     max_len: Optional[int] = None,
@@ -69,55 +127,53 @@ def apply_patch_embedding(
     x: torch.FloatTensor,
     patch_size: int,
     patch_stride: int,
-    lengths: Optional[torch.LongTensor] = None
+    lengths: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.FloatTensor, Optional[torch.LongTensor]]:
-    """Apply patching (frame concatenation) to input sequences.
-    
-    This operation concatenates consecutive frames to create patches,
-    reducing the temporal dimension while increasing the feature dimension.
-    
+    """
+    Returns per-sample patched lengths and masks away invalid windows.
+
     Args:
-        x: Input tensor [B, T, F]
-        patch_size: Number of frames to concatenate
-        patch_stride: Stride between patches
-        lengths: Optional sequence lengths [B]
-        
+        x:        [B, T, F] padded batch (zeros beyond each sample's length)
+        patch_size:  number of frames per patch (>= 2 in practice here)
+        patch_stride: stride between consecutive patches
+        lengths:  [B] true frame lengths for each sample (all >= patch_size)
+
     Returns:
-        Tuple of:
-        - Patched tensor [B, T_out, F * patch_size]
-        - Updated lengths if provided [B]
+        patches:     [B, K_full, F * patch_size] (K_full based on batch T)
+        new_lengths: [B] per-sample valid patch counts
     """
     if patch_size <= 1:
-        return x, lengths
-    
-    batch_size, seq_len, feat_dim = x.shape
-    
-    # Use unfold to create patches
-    # unfold dimension order: [B, F, T] -> [B, F, num_patches, patch_size]
-    x_transposed = x.transpose(1, 2)  # [B, F, T]
-    patches = x_transposed.unfold(
-        dimension=2,
-        size=patch_size,
-        step=patch_stride
-    )  # [B, F, num_patches, patch_size]
-    
-    # Reshape to [B, num_patches, F * patch_size]
-    num_patches = patches.shape[2]
-    patches = patches.permute(0, 2, 1, 3)  # [B, num_patches, F, patch_size]
-    patches = patches.reshape(batch_size, num_patches, feat_dim * patch_size)
-    
-    # Update lengths if provided
-    if lengths is not None:
-        # Patching concatenates 'patch_size' frames with 'patch_stride' step
-        # Output length = floor((L - patch_size) / patch_stride) + 1 if L >= patch_size, else 0
-        if patch_size > 1:
-            has_valid_window = lengths >= patch_size
-            new_lengths = torch.div(lengths - patch_size, patch_stride, rounding_mode='floor') + 1
-            lengths = torch.where(has_valid_window, new_lengths, torch.zeros_like(lengths))
-            # Ensure lengths stay positive
-            lengths = torch.clamp(lengths, min=1)
-    
-    return patches, lengths
+        return x, lengths  # no-op
+
+    B, T, F = x.shape
+    device  = x.device
+
+    # [B, F, T] → unfold over time: [B, F, K_full, patch_size]
+    xt = x.transpose(1, 2).contiguous()
+    patches4 = xt.unfold(dimension=2, size=patch_size, step=patch_stride)
+    K_full = patches4.size(2)
+
+    # [B, K_full, F * patch_size]
+    patches = patches4.permute(0, 2, 1, 3).reshape(B, K_full, F * patch_size)
+
+    if lengths is None:
+        # No masking possible/needed; caller guarantees padding semantics downstream
+        return patches, None
+
+    # Ensure lengths on same device
+    lengths = lengths.to(device)
+
+    # Valid windows per sample:
+    # new_len = floor((L - patch_size) / patch_stride) + 1  (given L >= patch_size)
+    new_lengths = torch.div(lengths - patch_size, patch_stride, rounding_mode='floor') + 1
+
+    # Mask out windows beyond each sample's valid count (keep K_full, zero tail)
+    if K_full > 0:
+        idx = torch.arange(K_full, device=device).view(1, K_full)          # [1, K_full]
+        mask = (idx < new_lengths.view(B, 1)).unsqueeze(-1)                 # [B, K_full, 1]
+        patches = patches * mask.to(patches.dtype)
+
+    return patches, new_lengths
 
 
 def get_activation_fn(name: str) -> torch.nn.Module:
@@ -170,7 +226,7 @@ def apply_locked_dropout(
     dropout_p: float,
     batch_size: int, 
     max_len: int,
-    output_size: int
+    feat_dim: Optional[int] = None
 ) -> torch.Tensor:
     """Apply locked dropout with consistent masks across time.
     
@@ -183,7 +239,7 @@ def apply_locked_dropout(
         dropout_p: Dropout probability
         batch_size: Batch size
         max_len: Maximum sequence length
-        output_size: Default output size for feature dimension
+        feat_dim: Feature dimension (computed from seq if None)
         
     Returns:
         Sequence with locked dropout applied
@@ -195,8 +251,9 @@ def apply_locked_dropout(
         # Unpack for dropout application
         x, lengths = pad_packed_sequence(seq, batch_first=True, total_length=max_len)
         
-        # Get feature dimension from actual sequence
-        feat_dim = feat_dim_from_seq(seq, max_len, output_size)
+        # Get feature dimension from actual sequence if not provided
+        if feat_dim is None:
+            feat_dim = seq.data.size(-1)
         
         # Create mask: [B, 1, F] - broadcasts across time dimension
         # Generate fresh mask for each forward pass
@@ -210,10 +267,11 @@ def apply_locked_dropout(
     else:
         # Handle regular tensor (not packed)
         B, T, F = seq.shape
+        feat_dim = F if (feat_dim is None) else feat_dim
         
         # Create mask: [B, 1, F] - broadcasts across time dimension
         # Generate fresh mask for each forward pass
-        mask = seq.new_empty((B, 1, F)).bernoulli_(1 - dropout_p).div_(1 - dropout_p)
+        mask = seq.new_empty((B, 1, feat_dim)).bernoulli_(1 - dropout_p).div_(1 - dropout_p)
         
         # Apply mask (broadcasts across time dimension)
         return seq * mask
@@ -244,6 +302,10 @@ def apply_output_zoneout(
         x, lens = pad_packed_sequence(seq, batch_first=True, total_length=max_len)
     else:
         x, lens = seq, lengths
+
+    # Ensure lens on same device as x
+    if lens is not None and lens.device != x.device:
+        lens = lens.to(x.device)
 
     # x: [B, T, F]; build time-shifted prev state (forward dir)
     prev = x.clone()
@@ -280,13 +342,14 @@ def apply_output_zoneout(
         return y
 
 
-def apply_interlayer_dropout(seq, layer_idx, batch_size, max_len, dropout, dropout_type, num_layers, output_size, dropout_modules, training):
+def apply_interlayer_dropout(seq, layer_idx, batch_size, max_len, dropout, dropout_type, num_layers, dropout_modules, training):
     """Apply inter-layer dropout (locked or standard)."""
     if not training or dropout <= 0 or layer_idx == num_layers - 1:
         return seq
     
     if dropout_type == 'locked':
-        return apply_locked_dropout(seq, dropout, batch_size, max_len, output_size)
+        feat_dim = feat_dim_from_seq(seq, max_len, None)
+        return apply_locked_dropout(seq, dropout, batch_size, max_len, feat_dim)
     else:
         # Standard dropout
         if isinstance(seq, PackedSequence):

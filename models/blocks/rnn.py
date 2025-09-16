@@ -17,7 +17,8 @@ class GRUBackbone(nn.Module):
     This module implements a stack of GRU layers with support for:
     - Packed sequences to skip padding computations
     - Intermediate layer outputs for auxiliary supervision
-    - Multiple dropout types (standard, variational, zoneout)
+    - Multiple dropout types (standard, locked)
+    - Output zoneout regularization
     - Learnable initial hidden states
     - Orthogonal weight initialization
     
@@ -26,7 +27,7 @@ class GRUBackbone(nn.Module):
         hidden_size: Size of GRU hidden state
         num_layers: Number of GRU layers
         dropout: Dropout probability between layers
-        dropout_type: Type of dropout ('standard', 'locked', 'zoneout')
+        dropout_type: Type of dropout ('standard', 'locked')
         zoneout: Zoneout probability for recurrent connections (0.0 to disable)
         bidirectional: If True, use bidirectional GRU
         use_packed: If True, use packed sequences
@@ -178,12 +179,12 @@ class GRUBackbone(nn.Module):
             seq, h = layer(seq, hidden[i])
             final_hidden.append(h)
             
-            # 2. Apply zoneout (if enabled)
-            if self.zoneout > 0:
+            # 2. Apply zoneout (if enabled and training)
+            if self.zoneout > 0 and self.training:
                 seq = apply_output_zoneout(seq, self.zoneout, lengths, max_len, self.bidirectional)
             
             # 3. Apply inter-layer dropout (locked or standard)
-            seq = apply_interlayer_dropout(seq, i, batch_size, max_len, self.dropout, self.dropout_type, self.num_layers, self.output_size, self.dropout_modules, self.training)
+            seq = apply_interlayer_dropout(seq, i, batch_size, max_len, self.dropout, self.dropout_type, self.num_layers, self.dropout_modules, self.training)
             
             # 4. Store intermediate output if requested (after regularization)
             if return_intermediates:
@@ -341,11 +342,13 @@ class LSTMBackbone(nn.Module):
                     nn.init.orthogonal_(param)
                 elif 'weight_ih' in name:
                     nn.init.xavier_uniform_(param)
-                elif 'bias_ih' in name or 'bias_hh' in name:
+                elif 'bias_ih' in name:
                     param.data.fill_(0)
                     # PyTorch gate order: (i, f, g, o)
                     n = param.size(0) // 4
                     param.data[n:2*n].fill_(1.0)  # forget gate bias = 1
+                elif 'bias_hh' in name:
+                    param.data.zero_()
     
     def forward(
         self,
@@ -400,12 +403,12 @@ class LSTMBackbone(nn.Module):
             seq, hc = layer(seq, hidden[i])
             final_hidden.append(hc)
             
-            # 2. Apply zoneout (if enabled)
-            if self.zoneout > 0:
+            # 2. Apply zoneout (if enabled and training)
+            if self.zoneout > 0 and self.training:
                 seq = apply_output_zoneout(seq, self.zoneout, lengths, max_len, self.bidirectional)
             
             # 3. Apply inter-layer dropout (locked or standard)
-            seq = apply_interlayer_dropout(seq, i, batch_size, max_len, self.dropout, self.dropout_type, self.num_layers, self.output_size, self.dropout_modules, self.training)
+            seq = apply_interlayer_dropout(seq, i, batch_size, max_len, self.dropout, self.dropout_type, self.num_layers, self.dropout_modules, self.training)
             
             # 4. Store intermediate output if requested (after regularization)
             if return_intermediates:

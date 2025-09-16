@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from .utils import apply_patch_embedding, get_activation_fn
+from .utils import apply_patch_embedding, get_activation_fn, time_mask_like
 
 
 class DayAdapter(nn.Module):
@@ -60,7 +60,7 @@ class DayAdapter(nn.Module):
         
         # Ensure features divide evenly into groups
         assert num_features % self.num_groups == 0, \
-            f"Features {num_features} must be divisible by groups {self.num_groups}"
+            f"DayAdapter(grouping={self.grouping}): num_features={num_features} not divisible by groups={self.num_groups}"
         
         # Create parameters for each day - vectorized for efficient lookup
         # Use delta parameterization: gamma = 1 + delta_gamma for better identity bias
@@ -88,9 +88,18 @@ class DayAdapter(nn.Module):
         """
         batch_size, seq_len, feat_dim = x.shape
         
+        # Ensure day indices are on correct device
+        if day_indices.device != x.device:
+            day_indices = day_indices.to(x.device)
+        
+        # Strict checking for out-of-range day indices
+        if torch.any((day_indices < 0) | (day_indices >= self.num_days)):
+            raise IndexError("DayAdapter: day index out of range.")
+        
         # Gather parameters for each sample's day - vectorized lookup
         delta_gamma_batch = self.delta_gammas[day_indices]  # [B, G, F/G]
-        gamma_batch = 1.0 + delta_gamma_batch  # [B, G, F/G]
+        # Use softplus trick to ensure gamma > 0: gamma = 1 + softplus(delta) - softplus(0)
+        gamma_batch = 1.0 + F.softplus(delta_gamma_batch) - F.softplus(torch.zeros_like(delta_gamma_batch))
         beta_batch = self.betas[day_indices]   # [B, G, F/G]
         
         # Reshape to match feature dimension
@@ -136,7 +145,8 @@ class DayAdapter(nn.Module):
         
         for day_idx in range(self.num_days):
             delta_gamma = self.delta_gammas[day_idx]  # [G, F/G]
-            gamma = 1.0 + delta_gamma  # [G, F/G]
+            # Use same softplus computation as in forward pass
+            gamma = 1.0 + F.softplus(delta_gamma) - F.softplus(torch.zeros_like(delta_gamma))
             beta = self.betas[day_idx]  # [G, F/G]
             
             stats[day_idx] = {
@@ -228,6 +238,8 @@ class PreNet(nn.Module):
         # Day-specific adaptation
         if self.day_adapter is not None and day_indices is not None:
             x = self.day_adapter(x, day_indices)
+            # Re-mask after FiLM to prevent padding leakage
+            x = x * time_mask_like(x, lengths)
         
         # Activation (before patching)
         x = self.activation(x)
@@ -255,6 +267,25 @@ class PreNet(nn.Module):
             })
         return ops
     
+    def export_config(self) -> Dict[str, Any]:
+        """Export compact configuration for W&B logging.
+        
+        Returns:
+            Dictionary containing key configuration parameters
+        """
+        return {
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "patch": {"size": self.patch_size, "stride": self.patch_stride},
+            "day_adapter": None if self.day_adapter is None else {
+                "grouping": self.day_adapter.grouping,
+                "num_days": self.day_adapter.num_days,
+                "l2_tether": self.day_adapter.l2_tether,
+                "l1_reg": self.day_adapter.l1_reg,
+            },
+            "activation": self.activation_name,
+        }
+    
     def regularization_loss(self) -> torch.Tensor:
         """Get regularization loss from day adapter.
         
@@ -272,6 +303,6 @@ class PreNet(nn.Module):
         if self.patch_size > 1:
             parts.append(f'patch_size={self.patch_size}, patch_stride={self.patch_stride}')
         if self.day_adapter:
-            parts.append(f'day_adapter=True')
+            parts.append(f'day_adapter=({self.day_adapter.grouping})')
         parts.append(f'activation={self.activation_name}')
         return ', '.join(parts)

@@ -8,7 +8,7 @@ from .prenet import DayAdapter, PreNet
 from .smoothers import (
     SmootherBase,
     GaussianSmoother,
-    DepthwiseCausalSmoother,
+    DepthwiseSmoother,
     EMASmoother,
     IdentitySmoother,
     build_smoother,
@@ -18,13 +18,10 @@ from .rnn import GRUBackbone, LSTMBackbone
 from .head import ProjectionHead, AuxiliaryHead, MultiHeadProjection, CTCHead
 from .calibrator import TemperatureScaling, PlattScaling, EnsembleTemperature
 from .utils import (
-    compute_output_lengths,
     mask_logits_,
     create_padding_mask,
     apply_patch_embedding,
-    get_activation_fn,
-    calculate_conv_output_length,
-    create_causal_mask
+    get_activation_fn
 )
 
 __all__ = [
@@ -35,7 +32,7 @@ __all__ = [
     # Smoothers
     "SmootherBase",
     "GaussianSmoother",
-    "DepthwiseCausalSmoother",
+    "DepthwiseSmoother",
     "EMASmoother",
     "IdentitySmoother",
     "build_smoother",
@@ -57,11 +54,8 @@ __all__ = [
     "EnsembleTemperature",
     
     # Utilities
-    "compute_output_lengths",
     "mask_logits_",
     "create_padding_mask",
     "apply_patch_embedding",
-    "get_activation_fn",
-    "calculate_conv_output_length",
-    "create_causal_mask"
+    "get_activation_fn"
 ]

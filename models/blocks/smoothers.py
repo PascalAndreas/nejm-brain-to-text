@@ -1,7 +1,8 @@
 """Temporal smoothing components for neural encoder models.
 
 This module provides various smoothing strategies for preprocessing
-neural signals, all with causal constraints and DC gain preservation.
+neural signals, with both causal and non-causal options, all designed
+for DC gain preservation and robust handling of variable-length sequences.
 """
 
 from typing import Optional, Tuple, Dict, Any
@@ -16,10 +17,11 @@ class SmootherBase(ABC, nn.Module):
     """Abstract base class for temporal smoothers.
     
     All smoothers must:
-    - Be causal (no future information)
+    - May be causal or non-causal depending on implementation
     - Preserve sequence length (stride=1)
-    - Maintain DC gain = 1 (preserve mean)
-    - Support variable-length sequences
+    - Should preserve DC gain on constant inputs (including near boundaries and with padding)
+    - Support variable-length sequences robustly
+    - Handle zero-padded batches without bias from padding
     """
     
     @abstractmethod
@@ -58,74 +60,63 @@ class SmootherBase(ABC, nn.Module):
         pass
 
 
-class DepthwiseCausalSmoother(SmootherBase):
-    """Learnable depthwise causal convolution for temporal smoothing.
+class DepthwiseSmoother(SmootherBase):
+    """Learnable depthwise *non-causal* convolution for temporal smoothing.
     
-    Applies causal 1D convolution independently per feature channel with
-    learnable kernels constrained to be valid smoothing filters (sum to 1).
-    Uses softmax parameterization for numerically stable normalization.
+    - One kernel per feature channel, normalized with softmax (sum=1).
+    - Symmetric receptive field (same padding).
+    - Length-aware masked renormalization to preserve DC gain near edges
+      and avoid bias from zero padding in batched variable-length inputs.
     
     Args:
         num_features: Number of input feature channels
-        kernel_size: Size of convolution kernel (should be odd)
+        kernel_size: Size of convolution kernel (forced to be odd for symmetric padding)
         residual_gate: If True, use gated residual connection y = (1-α)x + α·conv(x)
         init_std: Standard deviation for Gaussian initialization (in frames)
+        eps: Small epsilon for numerical stability in renormalization
     """
-    
+
     def __init__(
         self,
         num_features: int,
         kernel_size: int = 11,
         residual_gate: bool = True,
-        init_std: float = 2.0
+        init_std: float = 2.0,
+        eps: float = 1e-8,
     ):
         super().__init__()
-        
+        if kernel_size % 2 == 0:
+            kernel_size += 1  # ensure odd for symmetric padding
+
         self.num_features = num_features
         self.kernel_size = kernel_size
         self.residual_gate = residual_gate
-        
-        # Learnable kernel parameters (log-space, transformed with softmax)
-        self.kernel_params = nn.Parameter(
-            torch.zeros(num_features, 1, kernel_size)
-        )
-        
-        # Initialize to exact Gaussian
+        self.eps = eps
+
+        # Learnable per-channel kernels in log-space -> softmax along K
+        self.kernel_params = nn.Parameter(torch.zeros(num_features, 1, kernel_size))
         self._init_gaussian_kernel(init_std)
-        
-        # Residual gate parameters
+
         if residual_gate:
-            # Gate parameter α (will be transformed with sigmoid)
-            self.gate_param = nn.Parameter(torch.full((1,), -1.386))  # sigmoid(-1.386) ≈ 0.2
-        
-        # No bias in convolution
-        self.padding = kernel_size - 1  # For causal padding
-    
+            # shared gate alpha in (0,1), init ~0.2
+            self.gate_param = nn.Parameter(torch.full((1,), -1.386))
+
+    @torch.no_grad()
     def _init_gaussian_kernel(self, std: float):
-        """Initialize kernel parameters to exact Gaussian."""
-        with torch.no_grad():
-            # Create causal Gaussian kernel
-            positions = torch.arange(self.kernel_size, dtype=torch.float32)
-            positions = self.kernel_size - 1 - positions  # Reverse for causality
-            
-            # Gaussian values (normalized to sum=1)
-            gaussian = torch.exp(-(positions ** 2) / (2 * std ** 2))
-            gaussian = gaussian / gaussian.sum()
-            
-            # For softmax parameterization: φ = log(h + ε)
-            # This ensures softmax(φ) = h exactly
-            eps = 1e-8
-            log_gaussian = torch.log(gaussian + eps)
-            
-            # Set for all features
-            self.kernel_params.data = log_gaussian.unsqueeze(0).unsqueeze(0).expand_as(self.kernel_params)
-    
+        """Initialize kernel parameters to symmetric Gaussian."""
+        K = self.kernel_size
+        coords = torch.arange(K, dtype=torch.float32)
+        coords = coords - (K - 1) / 2.0
+        g = torch.exp(-(coords**2) / (2 * std * std))
+        g = g / g.sum()  # sum=1
+        self.kernel_params.copy_(g.log().view(1, 1, K).expand_as(self.kernel_params))
+
     def forward(
         self,
         x: torch.FloatTensor,
         lengths: Optional[torch.LongTensor] = None
     ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
-        """Apply depthwise causal smoothing.
+        """Apply depthwise non-causal smoothing with masked renormalization.
         
         Args:
             x: Input tensor [B, T, F]
@@ -134,60 +125,68 @@ class DepthwiseCausalSmoother(SmootherBase):
         Returns:
             Tuple of (smoothed tensor, unchanged lengths)
         """
-        batch_size, seq_len, feat_dim = x.shape
-        
-        # Transform kernel parameters to valid weights using softmax
-        # This ensures weights ≥ 0 and sum = 1 by construction
-        kernel_weights = F.softmax(self.kernel_params, dim=-1)  # [F, 1, K]
-        
-        # Reshape for depthwise convolution: [B, F, T]
-        x_conv = x.transpose(1, 2)
-        
-        # Apply causal padding (left padding = kernel_size - 1)
-        x_padded = F.pad(x_conv, (self.padding, 0), mode='constant', value=0)
-        
-        # Depthwise convolution
-        x_smoothed = F.conv1d(
-            x_padded,
-            kernel_weights,
-            groups=feat_dim,
-            stride=1
-        )
-        
-        # Restore shape: [B, T, F]
-        x_smoothed = x_smoothed.transpose(1, 2)
-        
-        # Apply residual gate if enabled: y = (1-α)x + α·conv(x)
+        # x: [B, T, F] -> conv wants [B, F, T]
+        B, T, num_feats = x.shape
+        k = torch.softmax(self.kernel_params, dim=-1)               # [F,1,K]
+        xt = x.transpose(1, 2).contiguous()                         # [B,F,T]
+
+        # Build per-sample validity mask m: [B,1,T] (1 for valid frames)
+        if lengths is None:
+            m = xt.new_ones((B, 1, T))
+        else:
+            if lengths.device != xt.device:
+                lengths = lengths.to(xt.device)
+            t = torch.arange(T, device=xt.device).view(1, 1, T)
+            m = (t < lengths.view(B, 1, 1)).to(dtype=xt.dtype)      # [B,1,T]
+
+        # Expand mask channel-wise to match depthwise groups
+        mF = m.expand(B, num_feats, T)                              # [B,F,T]
+
+        # Symmetric padding for both x and m (same amount left/right)
+        padding = self.kernel_size // 2
+        xt_pad = F.pad(xt, (padding, padding), mode="reflect")  # [B,F,T+2p]
+        m_pad  = F.pad(mF, (padding, padding), mode="constant", value=0.0)  # mask still needs zero padding
+
+        # Depthwise conv on x*m and on m, using the same per-channel kernel
+        num = F.conv1d(xt_pad * m_pad, k, groups=num_feats)         # [B,F,T]
+        den = F.conv1d(m_pad,       k, groups=num_feats)            # [B,F,T]
+
+        y = num / (den + self.eps)                                  # renormalize
+
+        # Residual gate (optional): y = (1-a) x + a y
         if self.residual_gate:
-            alpha = torch.sigmoid(self.gate_param)
-            x_smoothed = (1 - alpha) * x + alpha * x_smoothed
-        
-        return x_smoothed, lengths
-    
+            a = torch.sigmoid(self.gate_param)                      # scalar
+            y = (1 - a) * xt + a * y
+
+        # Zero out invalid tail explicitly (safety)
+        if lengths is not None:
+            y = y * mF
+
+        return y.transpose(1, 2).contiguous(), lengths
+
     def receptive_field(self) -> int:
         """Get the receptive field size."""
         return self.kernel_size
-    
+
+    @torch.no_grad()
     def get_effective_kernels(self) -> torch.Tensor:
         """Get the effective smoothing kernels after softmax normalization.
         
         Returns:
             Normalized kernel weights [F, K]
         """
-        with torch.no_grad():
-            weights = F.softmax(self.kernel_params, dim=-1).squeeze(1)  # [F, K]
-        return weights
-    
+        return torch.softmax(self.kernel_params, dim=-1).squeeze(1)  # [F,K]
+
     def export_config(self) -> Dict[str, Any]:
         """Export smoother configuration."""
         return {
-            'type': 'depthwise_causal',
-            'num_features': self.num_features,
-            'kernel_size': self.kernel_size,
-            'residual_gate': self.residual_gate,
-            'gate_value': torch.sigmoid(self.gate_param).item() if self.residual_gate else None
+            "type": "depthwise",
+            "num_features": self.num_features,
+            "kernel_size": self.kernel_size,
+            "residual_gate": self.residual_gate,
+            "gate_value": torch.sigmoid(self.gate_param).item() if self.residual_gate else None,
         }
-    
+
     def extra_repr(self) -> str:
         return f'num_features={self.num_features}, kernel_size={self.kernel_size}, residual_gate={self.residual_gate}'
 
@@ -246,7 +245,7 @@ class GaussianSmoother(SmootherBase):
         x: torch.FloatTensor,
         lengths: Optional[torch.LongTensor] = None
     ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
-        """Apply Gaussian smoothing.
+        """Apply Gaussian smoothing with masked renormalization.
         
         Args:
             x: Input tensor [B, T, F]
@@ -255,28 +254,38 @@ class GaussianSmoother(SmootherBase):
         Returns:
             Tuple of (smoothed tensor, unchanged lengths)
         """
-        batch_size, seq_len, feat_dim = x.shape
-        
-        # Reshape for depthwise convolution: [B, F, T]
-        x = x.transpose(1, 2)
-        
-        # Expand kernel for all feature channels: [F, 1, kernel_size]
-        kernel = self.kernel.unsqueeze(0).unsqueeze(0)
-        kernel = kernel.expand(feat_dim, 1, -1)
-        
-        # Apply depthwise convolution with same padding
+        B, T, num_feats = x.shape
+        # kernel 1D, same for all channels
+        k1 = self.kernel.view(1, 1, self.kernel_size)               # [1,1,K]
+        kF = k1.expand(num_feats, 1, -1)                            # [F,1,K]
+
+        xt = x.transpose(1, 2).contiguous()                         # [B,F,T]
+
+        # Build per-sample validity mask
+        if lengths is None:
+            m = xt.new_ones((B, 1, T))
+        else:
+            if lengths.device != xt.device:
+                lengths = lengths.to(xt.device)
+            t = torch.arange(T, device=xt.device).view(1, 1, T)
+            m = (t < lengths.view(B, 1, 1)).to(dtype=xt.dtype)      # [B,1,T]
+        mF = m.expand(B, num_feats, T)
+
+        # Symmetric padding for both x and m
         padding = self.kernel_size // 2
-        x_smoothed = F.conv1d(
-            x,
-            kernel,
-            groups=feat_dim,
-            padding=padding
-        )
-        
-        # Restore shape: [B, T, F]
-        x_smoothed = x_smoothed.transpose(1, 2)
-        
-        return x_smoothed, lengths
+        xt_pad = F.pad(xt, (padding, padding), mode="reflect")
+        m_pad  = F.pad(mF, (padding, padding), mode="constant", value=0.0)  # mask still needs zero padding
+
+        # Masked renormalization: convolve x*m and m separately, then divide
+        num = F.conv1d(xt_pad * m_pad, kF, groups=num_feats)        # [B,F,T]
+        den = F.conv1d(m_pad,       kF, groups=num_feats)           # [B,F,T]
+        y   = num / (den + 1e-8)
+
+        # safety: zero invalid tail
+        if lengths is not None:
+            y = y * mF
+
+        return y.transpose(1, 2).contiguous(), lengths
     
     def receptive_field(self) -> int:
         """Get the receptive field size."""
@@ -351,9 +360,9 @@ class EMASmoother(SmootherBase):
         # Get smoothing factors
         alphas = torch.sigmoid(self.alpha_logits)  # [F]
         
-        # Initialize hidden state
+        # Initialize hidden state (ensure dtype compatibility for AMP)
         y = torch.zeros_like(x)
-        h = torch.zeros(batch_size, feat_dim, device=device)  # [B, F]
+        h = x.new_zeros(batch_size, feat_dim)  # [B, F]
         
         # Apply IIR filter causally
         for t in range(seq_len):
@@ -429,8 +438,7 @@ class IdentitySmoother(SmootherBase):
 # Smoother registry for easy instantiation
 SMOOTHERS = {
     'gaussian': GaussianSmoother,
-    'depthwise_causal': DepthwiseCausalSmoother,
-    'dw_causal': DepthwiseCausalSmoother,  # Alias
+    'depthwise': DepthwiseSmoother,                 # New default: non-causal
     'ema': EMASmoother,
     'identity': IdentitySmoother,
     'none': IdentitySmoother,  # Alias
@@ -445,7 +453,7 @@ def build_smoother(
     """Build a smoother from configuration.
     
     Args:
-        smoother_type: Type of smoother ('gaussian', 'depthwise_causal', 'ema', 'identity')
+        smoother_type: Type of smoother ('gaussian', 'depthwise', 'depthwise_causal', 'ema', 'identity')
         num_features: Number of input features
         config: Additional configuration parameters
         
