@@ -9,19 +9,16 @@ This module provides a Lightning wrapper for training with:
 - Validation metrics
 """
 
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, Tuple
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import AdamW
 import pytorch_lightning as pl
-from torchmetrics import Accuracy, CharErrorRate, WordErrorRate
-import numpy as np
-from copy import deepcopy
 
 from .base import Batch, Emissions, NeuralEncoder
 from .gru_ctc import GRUCTC
-from .schedulers import build_lr_scheduler, build_aux_scheduler, AuxiliaryLossScheduler
+from .schedulers import build_lr_scheduler, build_loss_scheduler, LossScheduler
+from .blocks.utils import flatten_ctc_targets
 
 
 class EMA:
@@ -65,18 +62,12 @@ class EMA:
                 self.shadow[name] = param.data.clone().cpu()
     
     def get_decay(self) -> float:
-        """Get effective decay rate with bias correction.
+        """Get decay rate (now fixed, bias correction removed for stability).
         
         Returns:
-            Effective decay rate
+            Fixed decay rate
         """
-        if self.use_bias_correction:
-            # Bias-corrected decay that starts low and increases to base_decay
-            effective_decay = min(
-                self.base_decay,
-                (1 + self.updates) / (self.warmup_steps + self.updates)
-            )
-            return effective_decay
+        # Use fixed decay for stability - dynamic decay can hurt training
         return self.base_decay
     
     @torch.no_grad()
@@ -101,7 +92,7 @@ class EMA:
         """Determine if EMA should be updated at this step.
         
         Uses adaptive scheduling: more frequent updates early in training,
-        less frequent later.
+        less frequent later to save compute.
         
         Args:
             step: Current training step
@@ -193,66 +184,48 @@ class BrainToTextLightningModule(pl.LightningModule):
         # Save hyperparameters
         self.save_hyperparameters()
         
-        # Default configurations
-        self.optimizer_config = optimizer_config or {
+        # Store configs with defaults
+        self.optimizer_config = {
             'lr': 3e-4,
             'weight_decay': 1e-2,
             'betas': (0.9, 0.999),
-            'eps': 1e-8
+            'eps': 1e-8,
+            **(optimizer_config or {})
         }
         
-        self.scheduler_config = scheduler_config or {
+        self.scheduler_config = {
             'type': 'cosine',
             'warmup_steps': 5000,
             'max_lr': 3e-4,
-            'min_lr': 1e-6
+            'min_lr': 1e-6,
+            **(scheduler_config or {})
         }
         
         self.aux_loss_config = aux_loss_config or {}
+        self.film_reg_config = (training_config or {}).get('film_reg', {'weight': 0.0})
         
-        self.training_config = training_config or {
-            'gradient_clip_val': 1.0,
-            'accumulate_grad_batches': 1,
-            'val_check_interval': 1000,
-            'log_every_n_steps': 100
-        }
+        # Create model (simplified - always use GRUCTC for now)
+        aux_layer = model_config.pop('aux_layer', self.aux_loss_config.get('layer', None))
+        model_config['aux_layer'] = aux_layer
+        self.model = GRUCTC(**model_config)
         
-        # Extract auxiliary layer from model config if present
-        if 'aux_layer' in model_config:
-            aux_layer = model_config.pop('aux_layer')
-        else:
-            aux_layer = self.aux_loss_config.get('layer', None)
-        
-        # Create model
-        if 'name' in model_config:
-            # Import locally to avoid circular import
-            from . import build_encoder
-            # Add aux_layer to params if needed
-            params = model_config.get('params', {})
-            params['aux_layer'] = aux_layer
-            self.model = build_encoder(
-                model_config['name'],
-                params
-            )
-        else:
-            # Default to GRU-CTC
-            model_config['aux_layer'] = aux_layer
-            self.model = GRUCTC(**model_config)
-        
-        # EMA setup with bias correction
+        # EMA setup (simplified with fixed decay)
         self.use_ema = use_ema
         self.ema = None
         if use_ema:
             self.ema = EMA(
                 self.model,
                 decay=ema_decay,
-                use_bias_correction=ema_bias_correction,
-                warmup_steps=ema_warmup_steps,
-                device=self.device
+                use_bias_correction=False,  # Disabled for stability
+                warmup_steps=0  # Not used with fixed decay
             )
         
-        # Auxiliary loss scheduler
-        self.aux_scheduler = build_aux_scheduler(self.aux_loss_config)
+        # Get total steps from scheduler config for fractional specifications
+        total_steps = self.scheduler_config.get('T_max', None)
+        
+        # Unified loss schedulers
+        self.aux_scheduler = build_loss_scheduler(self.aux_loss_config, total_steps)
+        self.reg_scheduler = build_loss_scheduler(self.film_reg_config, total_steps)
         
         # Loss function
         self.ctc_loss = nn.CTCLoss(
@@ -261,17 +234,9 @@ class BrainToTextLightningModule(pl.LightningModule):
             zero_infinity=True
         )
         
-        # Metrics - remove unused TorchMetrics objects since we use custom PER computation
-        self.train_metrics = {
-            'loss': [],
-            'ctc_loss': [],
-            'aux_loss': [],
-            'reg_loss': []
-        }
+        # Removed unused train_metrics dict
         
-        # For tracking best model
-        self.best_val_loss = float('inf')
-        self.best_val_per = float('inf')
+        # Removed unused best model tracking (Lightning handles this)
     
     def forward(self, batch: Batch) -> Emissions:
         """Forward pass through the model.
@@ -284,12 +249,23 @@ class BrainToTextLightningModule(pl.LightningModule):
         """
         return self.model(batch)
     
+    def forward_for_calibration(self, batch):
+        """Forward pass for temperature calibration.
+        
+        Args:
+            batch: Input batch
+            
+        Returns:
+            Dict with logits, input_lengths, targets, target_lengths
+        """
+        return self.model.forward_for_calibration(batch)
+    
     def compute_loss(
         self,
         batch: Batch,
         emissions: Emissions
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute total loss and individual loss components.
+        """Compute total loss with scale-stable supervised loss mixing and additive FiLM penalty.
         
         Args:
             batch: Input batch with targets
@@ -298,67 +274,82 @@ class BrainToTextLightningModule(pl.LightningModule):
         Returns:
             Tuple of (total_loss, loss_dict)
         """
-        losses = {}
-        
-        # Main CTC loss
-        if batch.y is not None and batch.y_lens is not None:
-            # Transpose for CTC (expects [T, B, V])
-            log_probs = emissions.log_probs.transpose(0, 1)
+        losses: Dict[str, torch.Tensor] = {}
+
+        # --- main CTC ---
+        if batch.y is None or batch.y_lens is None:
+            return torch.tensor(0.0, device=self.device), losses
             
-            # Handle precision issues on MPS by casting to fp32 for CTC loss
-            if log_probs.device.type == 'mps' and log_probs.dtype == torch.float16:
-                log_probs = log_probs.float()
-            
-            ctc_loss = self.ctc_loss(
-                log_probs,
-                batch.y,
-                emissions.out_lens,
-                batch.y_lens
-            )
-            losses['ctc_loss'] = ctc_loss
-            total_loss = ctc_loss
+        log_probs = emissions.log_probs.transpose(0, 1)  # [T,B,V]
+        if log_probs.device.type == 'mps' and log_probs.dtype == torch.float16:
+            log_probs = log_probs.float()
+
+        # Flatten targets once (robust to any dataset padding)
+        targets_1d = flatten_ctc_targets(batch.y, batch.y_lens)
+        ctc_loss = self.ctc_loss(log_probs, targets_1d, emissions.out_lens, batch.y_lens)
+        losses['ctc_loss'] = ctc_loss
+        sup_loss = ctc_loss  # will be normalized mixture below
+
+        # --- auxiliary CTC (optional) ---
+        has_aux = bool(emissions.aux and 'aux_log_probs' in emissions.aux)
+        w_aux_base = float(self.aux_loss_config.get('weight', 0.0))
+        if self.aux_scheduler:
+            total_steps = getattr(self.trainer, 'estimated_stepping_batches', None) if self.trainer else None
+            w_aux_sched = float(self.aux_scheduler.get_weight(self.global_step, total_steps))
         else:
-            # No targets available (inference mode)
-            return torch.tensor(0.0), losses
+            w_aux_sched = 1.0
+        w_aux = w_aux_base * w_aux_sched
+
+        if has_aux and w_aux > 0:
+            aux_lp = emissions.aux['aux_log_probs'].transpose(0, 1)  # [T,B,V]
+            if aux_lp.device.type == 'mps' and aux_lp.dtype == torch.float16:
+                aux_lp = aux_lp.float()
+            aux_lens = emissions.aux.get('aux_lengths', emissions.out_lens)
+            aux_ctc = self.ctc_loss(aux_lp, targets_1d, aux_lens, batch.y_lens)
+            losses['aux_ctc_loss'] = aux_ctc
+
+            # scale-stable mixture (supervised only)
+            sup_den = 1.0 + w_aux
+            sup_loss = (ctc_loss + w_aux * aux_ctc) / sup_den
+
+            # log weights/factors
+            losses['aux_weight'] = torch.tensor(w_aux, device=self.device)
+            losses['aux_schedule_factor'] = torch.tensor(w_aux_sched, device=self.device)
+        else:
+            # still log weights for completeness
+            losses['aux_weight'] = torch.tensor(w_aux, device=self.device)
+            losses['aux_schedule_factor'] = torch.tensor(w_aux_sched, device=self.device)
+
+        # --- FiLM regularizer (optional, additive penalty) ---
+        reg_term = emissions.aux.get('film_reg_loss', None) if (emissions.aux is not None) else None
         
-        # Auxiliary CTC loss if available
-        if emissions.aux and 'aux_log_probs' in emissions.aux:
-            aux_log_probs = emissions.aux['aux_log_probs'].transpose(0, 1)
+        if reg_term is not None:
+            reg_term = reg_term.to(self.device)
+            losses['film_reg_loss'] = reg_term
             
-            # Handle precision issues on MPS by casting to fp32 for CTC loss
-            if aux_log_probs.device.type == 'mps' and aux_log_probs.dtype == torch.float16:
-                aux_log_probs = aux_log_probs.float()
-            
-            # Use aux_lengths if available, otherwise fall back to main output lengths
-            aux_out_lens = emissions.aux.get('aux_lengths', emissions.out_lens)
-            
-            aux_loss = self.ctc_loss(
-                aux_log_probs,
-                batch.y,
-                aux_out_lens,
-                batch.y_lens
-            )
-            
-            # Get weight from scheduler (base weight × schedule factor)
-            base_weight = self.aux_loss_config.get('weight', 0.0)
-            if self.aux_scheduler is not None:
-                schedule_factor = self.aux_scheduler.get_weight(self.global_step)
+            # Get effective weight with scheduler and fraction guard
+            if self.reg_scheduler is not None:
+                total_steps = getattr(self.trainer, 'estimated_stepping_batches', None) if self.trainer else None
+                w_reg_eff = self.reg_scheduler.get_effective_weight(
+                    self.global_step, 
+                    reg_term.item(), 
+                    sup_loss.detach().item(),
+                    total_steps
+                )
             else:
-                schedule_factor = 0.0
+                w_reg_eff = 0.0
             
-            aux_weight = base_weight * schedule_factor
+            losses['film_reg_weight'] = torch.tensor(w_reg_eff, device=self.device)
             
-            losses['aux_ctc_loss'] = aux_loss
-            losses['aux_weight'] = torch.tensor(aux_weight)
-            losses['aux_schedule_factor'] = torch.tensor(schedule_factor)
-            total_loss = total_loss + aux_weight * aux_loss
-        
-        # FiLM regularization loss
-        if emissions.aux and 'film_reg_loss' in emissions.aux:
-            reg_loss = emissions.aux['film_reg_loss']
-            losses['film_reg_loss'] = reg_loss
-            total_loss = total_loss + reg_loss
-        
+            if w_reg_eff > 0:
+                total_loss = sup_loss + w_reg_eff * reg_term
+            else:
+                total_loss = sup_loss
+        else:
+            total_loss = sup_loss
+            # Log zero weight for completeness
+            losses['film_reg_weight'] = torch.tensor(0.0, device=self.device)
+
         losses['total_loss'] = total_loss
         return total_loss, losses
     
@@ -385,18 +376,46 @@ class BrainToTextLightningModule(pl.LightningModule):
         for key, value in loss_dict.items():
             self.log(f'train/{key}', value, on_step=True, on_epoch=True, prog_bar=(key == 'total_loss'))
         
-        # EMA update will be moved to optimizer_step to happen after weight updates
-        # Log EMA stats periodically
-        if self.use_ema and self.ema is not None and self.global_step % 100 == 0:
-            ema_stats = self.ema.get_stats()
-            for key, value in ema_stats.items():
-                self.log(f'train/{key}', value)
+        # Log regularization to supervised ratio for sanity checking
+        if 'film_reg_loss' in loss_dict and 'film_reg_weight' in loss_dict and 'ctc_loss' in loss_dict:
+            reg_contrib = loss_dict['film_reg_weight'] * loss_dict['film_reg_loss']
+            sup_base = loss_dict['ctc_loss']
+            if 'aux_ctc_loss' in loss_dict and 'aux_weight' in loss_dict:
+                # Include aux in supervised base for ratio calculation
+                aux_contrib = loss_dict['aux_weight'] * loss_dict['aux_ctc_loss']
+                sup_base = (sup_base + aux_contrib) / (1.0 + loss_dict['aux_weight'])
+            
+            reg_to_sup_ratio = reg_contrib / (sup_base + 1e-12)
+            self.log('train/reg_to_sup_ratio', reg_to_sup_ratio, on_step=True, on_epoch=True)
+        
+        # Log learning rate and EMA stats periodically
+        if self.global_step % 100 == 0:
+            # Log current learning rate
+            if self.lr_schedulers():
+                current_lr = self.lr_schedulers().get_last_lr()[0]
+                self.log('train/lr', current_lr)
+            
+            # Log EMA stats
+            if self.use_ema and self.ema is not None:
+                ema_stats = self.ema.get_stats()
+                for key, value in ema_stats.items():
+                    self.log(f'train/{key}', value)
         
         # Step auxiliary scheduler if present
         if self.aux_scheduler is not None:
             self.aux_scheduler.step()
         
         return loss
+    
+    def on_validation_epoch_start(self):
+        """Apply EMA weights at start of validation epoch."""
+        if self.use_ema and self.ema is not None:
+            self.ema.apply_shadow()
+    
+    def on_validation_epoch_end(self):
+        """Restore original weights after validation epoch."""
+        if self.use_ema and self.ema is not None:
+            self.ema.restore()
     
     def validation_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
         """Validation step.
@@ -411,25 +430,17 @@ class BrainToTextLightningModule(pl.LightningModule):
         # Convert to standard batch format
         batch = Batch.from_dataset_batch(batch)
         
-        # Apply EMA weights for validation
-        if self.use_ema and self.ema is not None:
-            self.ema.apply_shadow()
-        
-        # Forward pass
+        # Forward pass (EMA weights already applied at epoch start)
         emissions = self.forward(batch)
         
         # Compute loss
         loss, loss_dict = self.compute_loss(batch, emissions)
         
-        # Restore original weights
-        if self.use_ema and self.ema is not None:
-            self.ema.restore()
-        
         # Log losses
         for key, value in loss_dict.items():
             self.log(f'val/{key}', value, on_step=False, on_epoch=True, prog_bar=(key == 'total_loss'))
         
-        # Compute phoneme error rate (simplified - actual implementation would use greedy decoding)
+        # Compute phoneme error rate
         if batch.y is not None:
             # Greedy decoding
             predictions = torch.argmax(emissions.log_probs, dim=-1)
@@ -543,6 +554,26 @@ class BrainToTextLightningModule(pl.LightningModule):
         
         return dp[m][n]
     
+    def calibrate_temperature(self, val_dataloader) -> float:
+        """Calibrate temperature scaling on validation data.
+        
+        This should be called after training is complete to fit the temperature
+        parameter that improves calibration.
+        
+        Args:
+            val_dataloader: Validation dataloader
+            
+        Returns:
+            Optimal temperature value
+        """
+        if not hasattr(self.model, 'eval_calibrate'):
+            print("Warning: Model does not support temperature calibration")
+            return 1.0
+            
+        # Use the same device as the model
+        device = str(next(self.model.parameters()).device)
+        return self.model.eval_calibrate(val_dataloader, device=device)
+    
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
         """Override optimizer step to update EMA after weight updates.
         
@@ -588,7 +619,7 @@ class BrainToTextLightningModule(pl.LightningModule):
         }
     
     def on_save_checkpoint(self, checkpoint: Dict) -> None:
-        """Save EMA and auxiliary scheduler state in checkpoint.
+        """Save EMA and loss scheduler states in checkpoint.
         
         Args:
             checkpoint: Checkpoint dictionary
@@ -598,9 +629,12 @@ class BrainToTextLightningModule(pl.LightningModule):
         
         if self.aux_scheduler is not None:
             checkpoint['aux_scheduler_state'] = self.aux_scheduler.state_dict()
+            
+        if self.reg_scheduler is not None:
+            checkpoint['reg_scheduler_state'] = self.reg_scheduler.state_dict()
     
     def on_load_checkpoint(self, checkpoint: Dict) -> None:
-        """Load EMA and auxiliary scheduler state from checkpoint.
+        """Load EMA and loss scheduler states from checkpoint.
         
         Args:
             checkpoint: Checkpoint dictionary
@@ -617,3 +651,6 @@ class BrainToTextLightningModule(pl.LightningModule):
         
         if self.aux_scheduler is not None and 'aux_scheduler_state' in checkpoint:
             self.aux_scheduler.load_state_dict(checkpoint['aux_scheduler_state'])
+            
+        if self.reg_scheduler is not None and 'reg_scheduler_state' in checkpoint:
+            self.reg_scheduler.load_state_dict(checkpoint['reg_scheduler_state'])

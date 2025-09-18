@@ -16,12 +16,13 @@ from .smoothers import (
 )
 from .rnn import GRUBackbone, LSTMBackbone
 from .head import ProjectionHead, AuxiliaryHead, MultiHeadProjection, CTCHead
-from .calibrator import TemperatureScaling, PlattScaling, EnsembleTemperature
 from .utils import (
     mask_logits_,
+    force_blank_on_pad_,
     create_padding_mask,
     apply_patch_embedding,
-    get_activation_fn
+    get_activation_fn,
+    flatten_ctc_targets
 )
 
 __all__ = [
@@ -48,14 +49,12 @@ __all__ = [
     "MultiHeadProjection",
     "CTCHead",
     
-    # Calibration
-    "TemperatureScaling",
-    "PlattScaling",
-    "EnsembleTemperature",
     
     # Utilities
     "mask_logits_",
+    "force_blank_on_pad_",
     "create_padding_mask",
     "apply_patch_embedding",
-    "get_activation_fn"
+    "get_activation_fn",
+    "flatten_ctc_targets"
 ]

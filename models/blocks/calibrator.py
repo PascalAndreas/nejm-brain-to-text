@@ -1,284 +1,77 @@
-"""Temperature calibration for neural encoder models.
+"""CTC-aware temperature calibration for neural encoder models.
 
-This module provides temperature scaling for model calibration,
-which improves the reliability of confidence scores.
+This module provides CTC-specific temperature scaling for model calibration,
+which improves the reliability of confidence scores by minimizing CTC loss
+on a held-out validation set.
+
+For CTC models, prefer CTCTemperatureCalibrator (below). The legacy
+TemperatureScaling/PlattScaling target framewise classification
+and are not alignment-aware.
 """
 
-from typing import Optional, Tuple
+import math
+import os
+from typing import Optional, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import LBFGS
-import numpy as np
-from tqdm import tqdm
 
 
-class TemperatureScaling(nn.Module):
-    """Temperature scaling for model calibration.
-    
-    Temperature scaling is a simple post-processing technique that improves
-    model calibration by scaling logits with a learned temperature parameter.
-    This is typically fitted on a validation set after training.
+# Legacy calibrator removed - temperature is now handled by CTCHead directly
+
+
+def framewise_ece(
+    log_probs: torch.Tensor, 
+    targets: torch.Tensor, 
+    input_lengths: torch.LongTensor, 
+    num_bins: int = 10
+) -> float:
+    """
+    Framewise ECE on valid frames only.
     
     Args:
-        initial_temperature: Initial temperature value
-        learnable: If True, temperature is a learnable parameter
-        device: Device for optimization
+        log_probs: Log probabilities [B,T,V]
+        targets: Target sequences [B,T] with pad idx to ignore
+        input_lengths: Valid sequence lengths [B]
+        num_bins: Number of bins for calibration
+        
+    Returns:
+        Expected Calibration Error
     """
+    B, T, V = log_probs.shape
+    device = log_probs.device
+    t = torch.arange(T, device=device).view(1, T)
+    mask = (t < input_lengths.view(B, 1)).unsqueeze(-1)   # [B,T,1]
+    probs = log_probs.exp()
+    conf, pred = probs.max(dim=-1)                       # [B,T]
     
-    def __init__(
-        self,
-        initial_temperature: float = 1.0,
-        learnable: bool = True,
-        device: str = 'cpu'
-    ):
-        super().__init__()
-        
-        self.device = device
-        
-        if learnable:
-            # Temperature as learnable parameter
-            self.temperature = nn.Parameter(torch.tensor(initial_temperature))
-        else:
-            # Fixed temperature
-            self.register_buffer('temperature', torch.tensor(initial_temperature))
+    # filter valid frames + valid labels if you have pad in targets
+    conf = conf[mask.squeeze(-1)]
+    if targets.dim() == 2:
+        lab = targets[mask.squeeze(-1)]
+        acc = (pred[mask.squeeze(-1)] == lab)
+    else:
+        # if you don't have aligned targets, skip accuracy computation
+        return float("nan")
     
-    def forward(self, logits: torch.FloatTensor) -> torch.FloatTensor:
-        """Apply temperature scaling to logits.
+    # Create bins on same device/dtype
+    bin_boundaries = torch.linspace(0, 1, num_bins + 1, device=device, dtype=conf.dtype)
+    
+    ece = 0.0
+    for i in range(num_bins):
+        # Select samples in bin - all bins use (a, b] for consistency
+        in_bin = (conf > bin_boundaries[i]) & (conf <= bin_boundaries[i + 1])
+        prop_in_bin = in_bin.float().mean()
         
-        Args:
-            logits: Input logits [B, T, V] or [B, V]
+        if prop_in_bin > 0:
+            # Compute accuracy and confidence in bin
+            accuracy_in_bin = acc[in_bin].float().mean()
+            avg_confidence_in_bin = conf[in_bin].mean()
             
-        Returns:
-            Scaled logits
-        """
-        return logits / self.temperature.clamp(min=1e-8)
+            # Add to ECE
+            ece += torch.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
     
-    def fit(
-        self,
-        model: nn.Module,
-        dataloader: torch.utils.data.DataLoader,
-        criterion: Optional[nn.Module] = None,
-        max_iter: int = 50,
-        tolerance: float = 1e-5
-    ) -> float:
-        """Fit temperature on validation data.
-        
-        Args:
-            model: The neural encoder model
-            dataloader: Validation dataloader
-            criterion: Loss function (default: NLLLoss)
-            max_iter: Maximum optimization iterations
-            tolerance: Convergence tolerance
-            
-        Returns:
-            Optimal temperature value
-        """
-        if criterion is None:
-            criterion = nn.NLLLoss(reduction='mean')
-        
-        # Collect model predictions
-        model.eval()
-        all_logits = []
-        all_labels = []
-        all_lengths = []
-        
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Collecting predictions"):
-                # Move batch to device
-                if hasattr(batch, 'to'):
-                    batch = batch.to(self.device)
-                
-                # Get model predictions
-                emissions = model(batch)
-                
-                # Store predictions and labels
-                all_logits.append(emissions.log_probs.cpu())
-                if batch.y is not None:
-                    all_labels.append(batch.y.cpu())
-                    all_lengths.append(batch.y_lens.cpu())
-        
-        if not all_labels:
-            print("Warning: No labels found for temperature calibration")
-            return 1.0
-        
-        # Concatenate all predictions
-        all_logits = torch.cat(all_logits, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
-        all_lengths = torch.cat(all_lengths, dim=0)
-        
-        # Move to optimization device
-        all_logits = all_logits.to(self.device)
-        all_labels = all_labels.to(self.device)
-        
-        # Optimize temperature
-        self.temperature.data = torch.tensor(1.0).to(self.device)
-        
-        optimizer = LBFGS(
-            [self.temperature],
-            lr=0.01,
-            max_iter=max_iter,
-            tolerance_change=tolerance
-        )
-        
-        def eval_loss():
-            optimizer.zero_grad()
-            
-            # Apply temperature scaling
-            scaled_logits = all_logits / self.temperature.clamp(min=1e-8)
-            
-            # Compute loss (simplified - you may need to handle CTC properly)
-            loss = 0.0
-            for i in range(len(all_logits)):
-                seq_len = all_lengths[i]
-                seq_logits = scaled_logits[i, :seq_len]
-                seq_labels = all_labels[i, :seq_len]
-                
-                # Simple cross-entropy loss (for CTC you'd use CTCLoss)
-                seq_loss = F.cross_entropy(
-                    seq_logits.view(-1, seq_logits.size(-1)),
-                    seq_labels.view(-1),
-                    ignore_index=0  # Ignore padding
-                )
-                loss += seq_loss
-            
-            loss = loss / len(all_logits)
-            loss.backward()
-            return loss
-        
-        print("Optimizing temperature...")
-        optimizer.step(eval_loss)
-        
-        optimal_temp = self.temperature.item()
-        print(f"Optimal temperature: {optimal_temp:.4f}")
-        
-        return optimal_temp
-    
-    def set_temperature(self, temperature: float):
-        """Manually set temperature value.
-        
-        Args:
-            temperature: New temperature value
-        """
-        if isinstance(self.temperature, nn.Parameter):
-            self.temperature.data = torch.tensor(temperature)
-        else:
-            self.temperature = torch.tensor(temperature)
-
-
-class PlattScaling(nn.Module):
-    """Platt scaling for binary or multi-class calibration.
-    
-    Platt scaling fits a sigmoid (binary) or softmax (multi-class) function
-    to map model outputs to calibrated probabilities.
-    
-    Args:
-        num_classes: Number of classes
-        use_bias: If True, use bias term
-    """
-    
-    def __init__(self, num_classes: int, use_bias: bool = True):
-        super().__init__()
-        
-        self.num_classes = num_classes
-        
-        if num_classes == 2:
-            # Binary case: single weight and bias
-            self.weight = nn.Parameter(torch.ones(1))
-            self.bias = nn.Parameter(torch.zeros(1)) if use_bias else None
-        else:
-            # Multi-class: linear transformation
-            self.weight = nn.Parameter(torch.eye(num_classes))
-            self.bias = nn.Parameter(torch.zeros(num_classes)) if use_bias else None
-    
-    def forward(self, logits: torch.FloatTensor) -> torch.FloatTensor:
-        """Apply Platt scaling.
-        
-        Args:
-            logits: Input logits [..., num_classes]
-            
-        Returns:
-            Scaled logits
-        """
-        if self.num_classes == 2:
-            # Binary scaling
-            scaled = logits * self.weight
-            if self.bias is not None:
-                scaled = scaled + self.bias
-        else:
-            # Multi-class scaling
-            scaled = torch.matmul(logits, self.weight.T)
-            if self.bias is not None:
-                scaled = scaled + self.bias
-        
-        return scaled
-
-
-class EnsembleTemperature(nn.Module):
-    """Temperature scaling for ensemble models.
-    
-    When ensembling multiple models, each model can have its own temperature
-    for better calibration.
-    
-    Args:
-        num_models: Number of models in ensemble
-        initial_temperature: Initial temperature for all models
-        shared: If True, use same temperature for all models
-    """
-    
-    def __init__(
-        self,
-        num_models: int,
-        initial_temperature: float = 1.0,
-        shared: bool = False
-    ):
-        super().__init__()
-        
-        self.num_models = num_models
-        self.shared = shared
-        
-        if shared:
-            self.temperature = nn.Parameter(torch.tensor(initial_temperature))
-        else:
-            self.temperatures = nn.ParameterList([
-                nn.Parameter(torch.tensor(initial_temperature))
-                for _ in range(num_models)
-            ])
-    
-    def forward(
-        self,
-        logits_list: list[torch.FloatTensor]
-    ) -> list[torch.FloatTensor]:
-        """Apply temperature scaling to ensemble predictions.
-        
-        Args:
-            logits_list: List of logits from each model
-            
-        Returns:
-            List of scaled logits
-        """
-        scaled_logits = []
-        
-        for i, logits in enumerate(logits_list):
-            if self.shared:
-                temp = self.temperature
-            else:
-                temp = self.temperatures[i]
-            
-            scaled_logits.append(logits / temp.clamp(min=1e-8))
-        
-        return scaled_logits
-    
-    def get_temperatures(self) -> list[float]:
-        """Get temperature values for all models.
-        
-        Returns:
-            List of temperature values
-        """
-        if self.shared:
-            return [self.temperature.item()] * self.num_models
-        else:
-            return [t.item() for t in self.temperatures]
+    return ece.item()
 
 
 def compute_ece(
@@ -286,7 +79,7 @@ def compute_ece(
     labels: torch.LongTensor,
     num_bins: int = 10
 ) -> float:
-    """Compute Expected Calibration Error (ECE).
+    """Compute Expected Calibration Error (ECE) - legacy framewise version.
     
     ECE measures the difference between confidence and accuracy across bins.
     
@@ -302,8 +95,8 @@ def compute_ece(
     confidences, predictions = torch.max(probs, dim=1)
     accuracies = predictions.eq(labels)
     
-    # Create bins
-    bin_boundaries = torch.linspace(0, 1, num_bins + 1)
+    # Create bins on same device/dtype as inputs
+    bin_boundaries = torch.linspace(0, 1, num_bins + 1, device=probs.device, dtype=probs.dtype)
     
     ece = 0.0
     for i in range(num_bins):
@@ -327,7 +120,7 @@ def compute_mce(
     labels: torch.LongTensor,
     num_bins: int = 10
 ) -> float:
-    """Compute Maximum Calibration Error (MCE).
+    """Compute Maximum Calibration Error (MCE) - legacy framewise version.
     
     MCE is the maximum difference between confidence and accuracy across bins.
     
@@ -343,8 +136,8 @@ def compute_mce(
     confidences, predictions = torch.max(probs, dim=1)
     accuracies = predictions.eq(labels)
     
-    # Create bins
-    bin_boundaries = torch.linspace(0, 1, num_bins + 1)
+    # Create bins on same device/dtype as inputs
+    bin_boundaries = torch.linspace(0, 1, num_bins + 1, device=probs.device, dtype=probs.dtype)
     
     max_calibration_error = 0.0
     for i in range(num_bins):
@@ -361,3 +154,137 @@ def compute_mce(
             max_calibration_error = max(max_calibration_error, calibration_error.item())
     
     return max_calibration_error
+
+
+class FitCTCTemperature:
+    """
+    Optimize the CTCHead's internal temperature on a validation loader.
+
+    Expects: model.eval() and a calibration forward that returns:
+      {'logits': [B,T,V], 'input_lengths': [B], 'targets': 1D, 'target_lengths': [B]}
+    """
+
+    def __init__(self, blank_idx: int = 0):
+        self.blank_idx = blank_idx
+
+    @torch.no_grad()
+    def _move_batch_to(self, batch, device: str):
+        """Move batch to device."""
+        if isinstance(batch, dict):
+            return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        if hasattr(batch, "to"):
+            return batch.to(device)
+        return batch
+
+    def run(
+        self,
+        model: nn.Module,
+        dataloader,
+        *,
+        device: str = "auto",
+        epochs: int = 5,
+        lr: float = 0.05,
+        use_amp: bool = False,
+    ) -> float:
+        """
+        Fit temperature parameter by minimizing CTC loss on validation data.
+        
+        Args:
+            model: The neural encoder model
+            dataloader: Validation dataloader
+            device: Device for optimization ("auto" detects from model)
+            epochs: Number of epochs to run (temperature usually converges fast)
+            lr: Learning rate for temperature optimization
+            use_amp: Whether to use automatic mixed precision
+            
+        Returns:
+            Optimal temperature value
+        """
+        model.eval()
+        
+        # Auto-detect device from model if needed
+        if device == "auto":
+            device = str(next(model.parameters()).device)
+        
+        # Handle MPS limitations - CTC Loss not supported natively on MPS
+        if device == "mps":
+            fallback_enabled = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") == "1"
+            if fallback_enabled:
+                print("⚠️  MPS detected with fallback enabled - CTC Loss will use CPU fallback")
+                print("   This may be slower than native CPU/CUDA but allows MPS training")
+            else:
+                print("⚠️  MPS device detected but CTC Loss is not supported on MPS")
+                print("   Options:")
+                print("   1. Set PYTORCH_ENABLE_MPS_FALLBACK=1 before importing torch")
+                print("   2. Use CPU: model = model.to('cpu')")
+                print("   3. Use CUDA if available")
+                raise RuntimeError(
+                    "CTC Loss not supported on MPS device. Please enable MPS fallback "
+                    "(PYTORCH_ENABLE_MPS_FALLBACK=1) or use CPU/CUDA for calibration."
+                )
+        
+        ctc = nn.CTCLoss(blank=self.blank_idx, zero_infinity=True).to(device)
+
+        # Grab head
+        head = model.ctc_head if hasattr(model, "ctc_head") else model.head
+
+        # 1) Materialize classwise τ vector (if used) BEFORE building optimizer
+        first = next(iter(dataloader))
+        first = self._move_batch_to(first, device)
+        with torch.no_grad():
+            out0 = model.forward_for_calibration(first)
+            logits0 = out0["logits"]
+            _ = head._apply_temperature(logits0)  # creates _tau_vec if needed
+
+        # 2) Build optimizer ONLY over temperature params
+        params = [head._tau_vec] if head.classwise_temp else [head._rho]
+        
+        # Guard against accidental gradients in projection weights
+        for p in head.projection.parameters():
+            p.requires_grad = False
+        head.enable_temp_training(True)
+        
+        opt = torch.optim.Adam(params, lr=lr)
+        # Device-agnostic GradScaler
+        device_type = 'cuda' if device.startswith('cuda') else device
+        scaler = torch.amp.GradScaler(device_type, enabled=use_amp)
+        
+        print(f"Initial temperature: {head.temperature():.4f}")
+
+        for epoch in range(epochs):
+            opt.zero_grad(set_to_none=True)
+            total_loss = 0.0
+            batch_count = 0
+
+            for batch in dataloader:
+                batch = self._move_batch_to(batch, device)
+
+                # No grads through model; only temp
+                with torch.no_grad():
+                    out = model.forward_for_calibration(batch)
+                    logits = out["logits"]             # [B,T,V] (raw)
+                    in_lens = out["input_lengths"]     # [B]
+                    targets = out["targets"]           # 1D concat
+                    tgt_lens = out["target_lengths"]   # [B]
+
+                with torch.amp.autocast(device_type, enabled=use_amp):
+                    logits_tau = head._apply_temperature(logits)
+                    logp = F.log_softmax(logits_tau, dim=-1).transpose(0, 1)  # [T,B,V]
+                    loss = ctc(logp, targets, in_lens, tgt_lens)
+
+                scaler.scale(loss).backward()
+                total_loss += float(loss.detach().cpu().item())
+                batch_count += 1
+
+            scaler.step(opt)
+            scaler.update()
+            
+            # Print progress for each epoch
+            avg_loss = total_loss / max(batch_count, 1)
+            temp = head.temperature()
+            print(f"[epoch {epoch + 1}/{epochs}] avg CTC = {avg_loss:.4f}, τ = {temp:.4f}")
+
+        head.enable_temp_training(False)
+        final_temp = head.temperature()
+        print(f"Final temperature: {final_temp:.4f}")
+        return final_temp

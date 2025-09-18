@@ -65,11 +65,20 @@ class Batch:
             'corpora': batch.get('corpora'),
         }
         
+        # Ensure x_lens is torch.long on CPU (required for pack_padded_sequence)
+        x_lens = batch['n_time_steps'].to(dtype=torch.long, device='cpu')
+        
+        # Handle potentially missing target data (e.g., in test sets)
+        y = batch.get('seq_class_ids')
+        y_lens = batch.get('phone_seq_lens')
+        if y_lens is not None:
+            y_lens = y_lens.to(dtype=torch.long, device='cpu')
+        
         return cls(
             x=batch['input_features'],
-            x_lens=batch['n_time_steps'],
-            y=batch.get('seq_class_ids'),
-            y_lens=batch.get('phone_seq_lens'),
+            x_lens=x_lens,
+            y=y,
+            y_lens=y_lens,
             day_id=batch.get('day_indices'),
             utt_id=utt_ids,
             meta=meta

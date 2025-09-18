@@ -36,7 +36,7 @@ model:
     
     # Smoother configuration (separate from PreNet)
     smoother_config:
-      type: depthwise_causal  # 'gaussian', 'depthwise_causal', 'ema', or 'identity'
+      type: depthwise  # 'gaussian', 'depthwise', 'ema', or 'identity'
       kernel_size: 11  # Kernel size for convolution-based smoothers
       residual_gate: true  # Gated residual connection
       init_std: 2.0  # Standard deviation for initialization
@@ -61,8 +61,8 @@ model:
     # Auxiliary layer for deep supervision (None to disable)
     aux_layer: 3  # Attach to layer 3 of 5
     
-    # Temperature calibration
-    temperature: 1.0  # Will be fitted on validation set
+    # Temperature calibration settings
+    temperature: 1.0  # Initial temperature for calibration (1.0 = no scaling)
 
 # Training configuration
 training:
@@ -84,11 +84,18 @@ training:
   aux_loss:
     enabled: true  # Enable auxiliary loss
     weight: 0.25  # Base weight for auxiliary loss
-    schedule:  # Weight scheduling
-      type: warmup_decay  # 'constant', 'warmup', 'warmup_decay', 'linear_decay'
-      warmup_steps: 5000  # Ramp up to full weight
-      hold_steps: 50000  # Hold at full weight  
-      decay_steps: 30000  # Decay to 0
+    type: warmup_hold_decay  # Warmup, hold, then decay pattern
+    warmup_fraction: 0.05  # Ramp up over first 5% of training
+    hold_fraction: 0.75    # Hold at full weight for 75% of training
+    decay_fraction: 0.20   # Decay over last 20% of training
+  
+  # FiLM regularization scheduling
+  film_reg:
+    weight: 1.0  # Base weight for FiLM regularization (multiplies DayAdapter's l2/l1)
+    type: warmup_decay  # Warmup then decay pattern
+    warmup_fraction: 0.05  # Warmup from 0 over first 5% of training
+    decay_fraction: 0.15   # Cosine decay over next 15% of training
+    max_fraction_of_supervised: 0.05  # Limit reg to 5% of supervised loss
   
   # Training settings
   max_epochs: 100
@@ -151,6 +158,20 @@ decoding:
   # Greedy decoding for quick validation
   use_greedy_for_val: true
 
+# Temperature calibration configuration
+calibration:
+  enabled: true  # Enable post-training temperature calibration
+  
+  # Calibration settings
+  epochs: 50  # Number of calibration epochs
+  lr: 0.01  # Learning rate for temperature optimization
+  
+  # Calibration method
+  classwise_temp: false  # If true, use per-class temperature scaling
+  
+  # Device settings (auto-detect from model if not specified)
+  device: auto
+
 # Emission caching configuration
 emission_cache:
   cache_dir: cache/emissions
@@ -195,13 +216,14 @@ experiment:
   
   # Notes
   notes: |
-    Refactored GRU-CTC model with modular architecture:
-    - Separate smoother module (depthwise causal, k=11, residual gate)
+    Refactored GRU-CTC model with modular architecture and optimizations:
+    - Separate smoother module (depthwise, k=11, residual gate)
     - FiLM day adaptation with delta parameterization and L2 tethering
     - Patching (size=4, stride=2) for length reduction
-    - 5-layer GRU with 768 hidden units and packed sequences
+    - 5-layer GRU with 768 hidden units and optimal mixed packing strategy
     - Auxiliary CTC at layer 3 with warmup-decay scheduling
-    - Main CTC head with proper masking before log_softmax
-    - Bias-corrected EMA with adaptive update schedule
-    - Temperature calibration on validation set
+    - Main CTC head with integrated temperature scaling and proper masking
+    - Fixed-decay EMA with adaptive update schedule for stability
+    - Post-training temperature calibration on validation set
+    - Consolidated CTC target flattening across all components
     - Weights & Biases logging for experiment tracking

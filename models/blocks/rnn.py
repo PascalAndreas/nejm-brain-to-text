@@ -12,15 +12,19 @@ from .utils import expand_h0, apply_output_zoneout, apply_interlayer_dropout
 
 
 class GRUBackbone(nn.Module):
-    """Multi-layer GRU backbone with packed sequence support.
+    """Multi-layer GRU backbone with optimized mixed packing strategy.
     
     This module implements a stack of GRU layers with support for:
-    - Packed sequences to skip padding computations
+    - Optimal mixed packing: packed sequences for GRU computation, unpacked for regularization
     - Intermediate layer outputs for auxiliary supervision
     - Multiple dropout types (standard, locked)
     - Output zoneout regularization
     - Learnable initial hidden states
     - Orthogonal weight initialization
+    
+    The mixed packing strategy provides the best performance by using packed sequences
+    only where they're most beneficial (RNN computation) while avoiding pack/unpack
+    overhead for regularization operations.
     
     Args:
         input_size: Size of input features
@@ -30,7 +34,6 @@ class GRUBackbone(nn.Module):
         dropout_type: Type of dropout ('standard', 'locked')
         zoneout: Zoneout probability for recurrent connections (0.0 to disable)
         bidirectional: If True, use bidirectional GRU
-        use_packed: If True, use packed sequences
         learnable_h0: If True, use learnable initial hidden state
     """
     
@@ -43,7 +46,6 @@ class GRUBackbone(nn.Module):
         dropout_type: Literal['standard', 'locked'] = 'standard',
         zoneout: float = 0.0,
         bidirectional: bool = False,
-        use_packed: bool = True,
         learnable_h0: bool = True
     ):
         super().__init__()
@@ -63,7 +65,6 @@ class GRUBackbone(nn.Module):
         self.dropout_type = dropout_type
         self.zoneout = zoneout
         self.bidirectional = bidirectional
-        self.use_packed = use_packed
         self.num_directions = 2 if bidirectional else 1
         self.output_size = hidden_size * self.num_directions
         
@@ -160,48 +161,49 @@ class GRUBackbone(nn.Module):
                     )
                 hidden.append(h)
         
-        # Pack input if using packed sequences
-        if self.use_packed and lengths is not None:
-            seq = pack_padded_sequence(
-                x, lengths.cpu(), batch_first=True, enforce_sorted=False
-            )
-        else:
-            seq = x
+        # Optimal mixed packing strategy: pack only for RNN computation,
+        # work with unpacked tensors for regularization to minimize overhead
         
-        # No need for mask lifecycle management - we regenerate per forward pass
+        # Cache CPU lengths once for packing operations (lengths must be on CPU for pack_padded_sequence)
+        lengths_cpu = lengths.cpu() if lengths is not None else None
+        
+        # Start with unpacked tensor - we'll pack only for RNN layers
+        seq = x
         
         # Process through layers
         intermediates = [] if return_intermediates else None
         final_hidden = []
         
         for i, layer in enumerate(self.layers):
-            # 1. Forward through layer
-            seq, h = layer(seq, hidden[i])
+            # 1. Pack only for the RNN layer to get computational benefits
+            if lengths is not None:
+                packed_seq = pack_padded_sequence(
+                    seq, lengths_cpu, batch_first=True, enforce_sorted=False
+                )
+                packed_out, h = layer(packed_seq, hidden[i])
+                # Immediately unpack after RNN for subsequent operations
+                seq, _ = pad_packed_sequence(
+                    packed_out, batch_first=True, total_length=max_len
+                )
+            else:
+                # No packing needed if no length information
+                seq, h = layer(seq, hidden[i])
+                
             final_hidden.append(h)
             
-            # 2. Apply zoneout (if enabled and training)
+            # 2. Apply zoneout directly on unpacked tensor (more efficient)
             if self.zoneout > 0 and self.training:
                 seq = apply_output_zoneout(seq, self.zoneout, lengths, max_len, self.bidirectional)
             
-            # 3. Apply inter-layer dropout (locked or standard)
-            seq = apply_interlayer_dropout(seq, i, batch_size, max_len, self.dropout, self.dropout_type, self.num_layers, self.dropout_modules, self.training)
+            # 3. Apply inter-layer dropout directly on unpacked tensor
+            seq = apply_interlayer_dropout(seq, i, batch_size, max_len, self.dropout, self.dropout_type, self.num_layers, self.dropout_modules, self.training, lengths)
             
-            # 4. Store intermediate output if requested (after regularization)
+            # 4. Store intermediate output (already unpacked)
             if return_intermediates:
-                if isinstance(seq, PackedSequence):
-                    # Unpack to get tensor
-                    out_i, _ = pad_packed_sequence(
-                        seq, batch_first=True, total_length=max_len
-                    )
-                else:
-                    out_i = seq
-                intermediates.append(out_i)
+                intermediates.append(seq)
         
-        # Unpack final output
-        if isinstance(seq, PackedSequence):
-            output, _ = pad_packed_sequence(seq, batch_first=True, total_length=max_len)
-        else:
-            output = seq
+        # Output is already unpacked
+        output = seq
         
         return output, final_hidden, intermediates
     
@@ -226,7 +228,6 @@ class GRUBackbone(nn.Module):
             'dropout_type': self.dropout_type,
             'zoneout': self.zoneout,
             'bidirectional': self.bidirectional,
-            'use_packed': self.use_packed,
             'learnable_h0': self.h0 is not None
         }
     
@@ -234,14 +235,15 @@ class GRUBackbone(nn.Module):
         s = (f'input_size={self.input_size}, hidden_size={self.hidden_size}, '
              f'num_layers={self.num_layers}, dropout={self.dropout}, '
              f'dropout_type={self.dropout_type}, zoneout={self.zoneout}, '
-             f'bidirectional={self.bidirectional}, use_packed={self.use_packed}')
+             f'bidirectional={self.bidirectional}, mixed_packing=True')
         return s
 
 
 class LSTMBackbone(nn.Module):
-    """LSTM backbone with support for intermediate outputs.
+    """Multi-layer LSTM backbone with optimized mixed packing strategy.
     
-    Similar to GRUBackbone but using LSTM cells.
+    Similar to GRUBackbone but using LSTM cells. Uses the same optimal mixed
+    packing strategy for best performance.
     """
     
     def __init__(
@@ -253,7 +255,6 @@ class LSTMBackbone(nn.Module):
         dropout_type: Literal['standard', 'locked'] = 'standard',
         zoneout: float = 0.0,
         bidirectional: bool = False,
-        use_packed: bool = True,
         learnable_h0: bool = True,
         h0_init: Literal['zeros', 'orthogonal'] = 'orthogonal',
         c0_init: Literal['zeros', 'orthogonal'] = 'orthogonal'
@@ -275,7 +276,6 @@ class LSTMBackbone(nn.Module):
         self.dropout_type = dropout_type
         self.zoneout = zoneout
         self.bidirectional = bidirectional
-        self.use_packed = use_packed
         self.h0_init = h0_init
         self.c0_init = c0_init
         self.num_directions = 2 if bidirectional else 1
@@ -386,44 +386,48 @@ class LSTMBackbone(nn.Module):
                 else:
                     hidden.append(None)
         
-        # Pack input if using packed sequences
-        if self.use_packed and lengths is not None:
-            seq = pack_padded_sequence(
-                x, lengths.cpu(), batch_first=True, enforce_sorted=False
-            )
-        else:
-            seq = x
+        # Optimal mixed packing strategy: pack only for RNN computation,
+        # work with unpacked tensors for regularization to minimize overhead
+        
+        # Cache CPU lengths once for packing operations (lengths must be on CPU for pack_padded_sequence)
+        lengths_cpu = lengths.cpu() if lengths is not None else None
+        
+        # Start with unpacked tensor - we'll pack only for RNN layers
+        seq = x
         
         # Process through layers
         intermediates = [] if return_intermediates else None
         final_hidden = []
         
         for i, layer in enumerate(self.layers):
-            # 1. Forward through layer
-            seq, hc = layer(seq, hidden[i])
+            # 1. Pack only for the LSTM layer to get computational benefits
+            if lengths is not None:
+                packed_seq = pack_padded_sequence(
+                    seq, lengths_cpu, batch_first=True, enforce_sorted=False
+                )
+                packed_out, hc = layer(packed_seq, hidden[i])
+                # Immediately unpack after RNN for subsequent operations
+                seq, _ = pad_packed_sequence(
+                    packed_out, batch_first=True, total_length=max_len
+                )
+            else:
+                # No packing needed if no length information
+                seq, hc = layer(seq, hidden[i])
+                
             final_hidden.append(hc)
             
-            # 2. Apply zoneout (if enabled and training)
+            # 2. Apply zoneout directly on unpacked tensor (more efficient)
             if self.zoneout > 0 and self.training:
                 seq = apply_output_zoneout(seq, self.zoneout, lengths, max_len, self.bidirectional)
             
-            # 3. Apply inter-layer dropout (locked or standard)
-            seq = apply_interlayer_dropout(seq, i, batch_size, max_len, self.dropout, self.dropout_type, self.num_layers, self.dropout_modules, self.training)
+            # 3. Apply inter-layer dropout directly on unpacked tensor
+            seq = apply_interlayer_dropout(seq, i, batch_size, max_len, self.dropout, self.dropout_type, self.num_layers, self.dropout_modules, self.training, lengths)
             
-            # 4. Store intermediate output if requested (after regularization)
+            # 4. Store intermediate output (already unpacked)
             if return_intermediates:
-                if isinstance(seq, PackedSequence):
-                    out_i, _ = pad_packed_sequence(
-                        seq, batch_first=True, total_length=max_len
-                    )
-                else:
-                    out_i = seq
-                intermediates.append(out_i)
+                intermediates.append(seq)
         
-        # Unpack final output
-        if isinstance(seq, PackedSequence):
-            output, _ = pad_packed_sequence(seq, batch_first=True, total_length=max_len)
-        else:
-            output = seq
+        # Output is already unpacked
+        output = seq
         
         return output, final_hidden, intermediates

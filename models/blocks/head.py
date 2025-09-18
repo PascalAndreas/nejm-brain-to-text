@@ -260,6 +260,8 @@ class CTCHead(nn.Module):
         vocab_size: Size of output vocabulary
         blank_idx: Index of CTC blank token (default: 0)
         dropout: Dropout probability
+        init_temp: Initial temperature value
+        classwise_temp: If True, use per-class temperature scaling
     """
     
     def __init__(
@@ -267,7 +269,9 @@ class CTCHead(nn.Module):
         input_size: int,
         vocab_size: int,
         blank_idx: int = 0,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        init_temp: float = 1.0,
+        classwise_temp: bool = False,
     ):
         super().__init__()
         
@@ -279,20 +283,58 @@ class CTCHead(nn.Module):
         # Projection head
         self.projection = ProjectionHead(input_size, vocab_size, dropout=dropout)
         
-        # Log-softmax is applied in forward
+        # τ = exp(ρ) for positivity. Off by default during training (no grads).
+        self.classwise_temp = classwise_temp
+        self._rho = nn.Parameter(torch.tensor(math.log(init_temp)), requires_grad=False)
+        self._tau_vec = None  # lazily created if classwise
+    
+    # --- temperature utilities ---
+    def enable_temp_training(self, enabled: bool = True):
+        """Enable/disable temperature parameter training."""
+        self._rho.requires_grad = enabled
+        if self._tau_vec is not None:
+            self._tau_vec.requires_grad = enabled
+
+    def set_temperature(self, tau: float):
+        """Set temperature value."""
+        with torch.no_grad():
+            tau = max(float(tau), 1e-6)
+            self._rho.copy_(torch.tensor(math.log(tau), device=self._rho.device))
+
+    def temperature(self) -> float:
+        """Get current temperature value."""
+        if self.classwise_temp and (self._tau_vec is not None):
+            return float(self._tau_vec.detach().mean().item())
+        return float(self._rho.detach().exp().item())
+
+    def _apply_temperature(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply temperature scaling to logits."""
+        if self.classwise_temp:
+            V = logits.size(-1)
+            if (self._tau_vec is None) or (self._tau_vec.numel() != V):
+                tau0 = self._rho.detach().exp().item()
+                self._tau_vec = nn.Parameter(
+                    torch.full((V,), tau0, device=logits.device),
+                    requires_grad=False,
+                )
+            tau = self._tau_vec.view(1, 1, -1)
+        else:
+            tau = self._rho.exp()
+        return logits / tau.clamp_min(1e-6)
+    # -----------------------------
     
     def forward(
         self,
         x: torch.FloatTensor,
         lengths: Optional[torch.LongTensor] = None,
-        temperature: float = 1.0
+        temperature: Optional[float] = None
     ) -> torch.FloatTensor:
         """Compute log probabilities for CTC.
         
         Args:
             x: Input tensor [B, T, H]
             lengths: Sequence lengths for masking [B]
-            temperature: Temperature for calibration
+            temperature: Temperature override for ablations
             
         Returns:
             Log probabilities [B, T, V]
@@ -300,9 +342,11 @@ class CTCHead(nn.Module):
         # Project to logits
         logits = self.projection(x)
         
-        # Apply temperature scaling
-        if temperature != 1.0:
-            logits = logits / temperature
+        # Prefer internal temp; allow override for ablations
+        if temperature is not None and temperature != 1.0:
+            logits = logits / max(temperature, 1e-6)
+        else:
+            logits = self._apply_temperature(logits)
         
         # Safe masking: force blank on padded frames to avoid NaNs
         if lengths is not None:
@@ -318,24 +362,28 @@ class CTCHead(nn.Module):
         self,
         x: torch.FloatTensor,
         lengths: Optional[torch.LongTensor] = None,
-        mask_pad: bool = False
+        apply_temperature: bool = False
     ) -> torch.FloatTensor:
         """Get raw logits without log-softmax.
         
         Args:
             x: Input tensor [B, T, H]
             lengths: Sequence lengths for masking [B]
-            mask_pad: If True, apply safe padding mask to logits
+            apply_temperature: If True, apply temperature scaling
             
         Returns:
             Logits tensor [B, T, V]
         """
         logits = self.projection(x)
         
-        # Optional safe masking for decoding
-        if mask_pad and lengths is not None:
+        # Optional safe masking for decoding (before temperature scaling)
+        if lengths is not None:
             from .utils import force_blank_on_pad_
             force_blank_on_pad_(logits, lengths, self.blank_idx)
+        
+        # Apply temperature if requested (after masking)
+        if apply_temperature:
+            logits = self._apply_temperature(logits)
         
         return logits
     

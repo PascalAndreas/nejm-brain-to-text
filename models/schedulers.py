@@ -53,89 +53,142 @@ class WarmupCosineScheduler(_LRScheduler):
             ]
 
 
-class AuxiliaryLossScheduler:
-    """Scheduler for auxiliary loss weight.
+class LossScheduler:
+    """Unified scheduler for auxiliary and regularization loss weights.
     
-    Supports various scheduling strategies including constant,
-    linear warmup, and warmup-hold-decay patterns.
+    Supports various scheduling patterns with fractional step specifications only.
+    Can handle both auxiliary CTC loss and FiLM regularization scheduling.
     
     Args:
-        base_weight: Base weight for auxiliary loss
-        schedule_type: Type of schedule ('constant', 'warmup', 'warmup_decay')
-        warmup_steps: Steps to warm up to base weight
-        hold_steps: Steps to hold at base weight (for warmup_decay)
-        decay_steps: Steps to decay to 0 (for warmup_decay)
+        base_weight: Base weight for the loss component
+        schedule_type: Type of schedule ('constant', 'warmup', 'warmup_decay', 'warmup_hold_decay')
+        warmup_fraction: Fraction of total steps to warm up (0 to base_weight)
+        hold_fraction: Fraction of total steps to hold at base_weight (for warmup_hold_decay)
+        decay_fraction: Fraction of total steps for final decay
+        total_steps: Total training steps
+        max_fraction_of_supervised: Optional fraction guard (for regularization)
     """
     
     def __init__(
         self,
-        base_weight: float = 0.25,
+        base_weight: float = 1.0,
         schedule_type: str = 'constant',
-        warmup_steps: int = 5000,
-        hold_steps: int = 50000,
-        decay_steps: int = 30000
+        warmup_fraction: float = 0.05,
+        hold_fraction: Optional[float] = None,
+        decay_fraction: Optional[float] = None,
+        total_steps: Optional[int] = None,
+        max_fraction_of_supervised: Optional[float] = None
     ):
         self.base_weight = base_weight
         self.schedule_type = schedule_type
-        self.warmup_steps = warmup_steps
-        self.hold_steps = hold_steps
-        self.decay_steps = decay_steps
+        self.warmup_fraction = warmup_fraction
+        self.hold_fraction = hold_fraction
+        self.decay_fraction = decay_fraction
+        self.total_steps = total_steps
+        self.max_fraction_of_supervised = max_fraction_of_supervised
         self.current_step = 0
     
     def step(self) -> float:
-        """Get weight for current step and increment counter.
-        
-        Returns:
-            Auxiliary loss weight for current step
-        """
+        """Get weight for current step and increment counter."""
         weight = self.get_weight(self.current_step)
         self.current_step += 1
         return weight
     
-    def get_weight(self, step: Optional[int] = None) -> float:
-        """Get auxiliary loss weight for a given step.
+    def get_weight(self, step: int, total_steps: Optional[int] = None) -> float:
+        """Get loss weight for a given step.
         
         Args:
-            step: Training step (uses internal counter if None)
+            step: Training step
+            total_steps: Total steps (overrides instance total_steps if provided)
             
         Returns:
-            Auxiliary loss weight
+            Loss weight
         """
-        if step is None:
-            step = self.current_step
+        T = total_steps or self.total_steps
+        if T is None:
+            # Fallback for missing total_steps
+            if self.schedule_type == 'constant':
+                return self.base_weight
+            else:
+                # Simple linear warmup over 5000 steps then hold
+                return min(self.base_weight, self.base_weight * step / 5000)
         
         if self.schedule_type == 'constant':
             return self.base_weight
         
         elif self.schedule_type == 'warmup':
             # Linear warmup only
-            if step < self.warmup_steps:
-                return self.base_weight * (step / self.warmup_steps)
+            W = int(self.warmup_fraction * T)
+            if step < W:
+                return self.base_weight * step / max(1, W)
             else:
                 return self.base_weight
         
         elif self.schedule_type == 'warmup_decay':
-            # Warmup, hold, then decay to 0
-            if step < self.warmup_steps:
+            # Warmup then immediate cosine decay (for regularization)
+            W = int(self.warmup_fraction * T)
+            D = int(self.decay_fraction * T) if self.decay_fraction else int(0.2 * T)
+            
+            if step < W:
+                # Linear warmup from 0 to base_weight
+                return self.base_weight * step / max(1, W)
+            elif step < (T - D):
+                # Hold at base_weight
+                return self.base_weight
+            else:
+                # Cosine decay to ~0
+                t = step - (T - D)
+                return self.base_weight * 0.5 * (1.0 + math.cos(math.pi * t / max(1, D)))
+        
+        elif self.schedule_type == 'warmup_hold_decay':
+            # Warmup, hold, then decay (for auxiliary loss)
+            W = int(self.warmup_fraction * T)
+            H = int(self.hold_fraction * T) if self.hold_fraction else int(0.7 * T)
+            D = int(self.decay_fraction * T) if self.decay_fraction else int(0.2 * T)
+            
+            if step < W:
                 # Linear warmup
-                return self.base_weight * (step / self.warmup_steps)
-            elif step < self.warmup_steps + self.hold_steps:
+                return self.base_weight * step / max(1, W)
+            elif step < (W + H):
                 # Hold constant
                 return self.base_weight
             else:
                 # Cosine decay to 0
-                decay_progress = min(1.0, (step - self.warmup_steps - self.hold_steps) / self.decay_steps)
+                decay_start = W + H
+                decay_progress = min(1.0, (step - decay_start) / max(1, D))
                 return self.base_weight * 0.5 * (1 + math.cos(decay_progress * math.pi))
-        
-        elif self.schedule_type == 'linear_decay':
-            # Linear decay from start
-            if step < self.decay_steps:
-                return self.base_weight * (1 - step / self.decay_steps)
-            else:
-                return 0.0
         
         else:
             raise ValueError(f"Unknown schedule type: {self.schedule_type}")
+    
+    def get_effective_weight(
+        self, 
+        step: int, 
+        loss_value: float, 
+        supervised_loss: float, 
+        total_steps: Optional[int] = None
+    ) -> float:
+        """Get effective weight with optional fraction-of-supervised guard.
+        
+        Args:
+            step: Current training step
+            loss_value: Current loss component value
+            supervised_loss: Current supervised loss value
+            total_steps: Total steps
+            
+        Returns:
+            Effective weight (potentially clamped by fraction guard)
+        """
+        base_weight = self.get_weight(step, total_steps)
+        
+        if (self.max_fraction_of_supervised is None or 
+            self.max_fraction_of_supervised <= 0 or 
+            loss_value <= 0):
+            return base_weight
+        
+        # Compute fraction guard: λ_eff * L ≤ α * L_sup
+        max_allowed = self.max_fraction_of_supervised * supervised_loss / (loss_value + 1e-12)
+        return min(base_weight, max_allowed)
     
     def state_dict(self) -> Dict[str, Any]:
         """Get scheduler state for checkpointing."""
@@ -143,19 +196,23 @@ class AuxiliaryLossScheduler:
             'current_step': self.current_step,
             'base_weight': self.base_weight,
             'schedule_type': self.schedule_type,
-            'warmup_steps': self.warmup_steps,
-            'hold_steps': self.hold_steps,
-            'decay_steps': self.decay_steps
+            'warmup_fraction': self.warmup_fraction,
+            'hold_fraction': self.hold_fraction,
+            'decay_fraction': self.decay_fraction,
+            'total_steps': self.total_steps,
+            'max_fraction_of_supervised': self.max_fraction_of_supervised
         }
     
     def load_state_dict(self, state_dict: Dict[str, Any]):
         """Load scheduler state from checkpoint."""
-        self.current_step = state_dict['current_step']
+        self.current_step = state_dict.get('current_step', 0)
         self.base_weight = state_dict.get('base_weight', self.base_weight)
         self.schedule_type = state_dict.get('schedule_type', self.schedule_type)
-        self.warmup_steps = state_dict.get('warmup_steps', self.warmup_steps)
-        self.hold_steps = state_dict.get('hold_steps', self.hold_steps)
-        self.decay_steps = state_dict.get('decay_steps', self.decay_steps)
+        self.warmup_fraction = state_dict.get('warmup_fraction', self.warmup_fraction)
+        self.hold_fraction = state_dict.get('hold_fraction', self.hold_fraction)
+        self.decay_fraction = state_dict.get('decay_fraction', self.decay_fraction)
+        self.total_steps = state_dict.get('total_steps', self.total_steps)
+        self.max_fraction_of_supervised = state_dict.get('max_fraction_of_supervised', self.max_fraction_of_supervised)
 
 
 def build_lr_scheduler(
@@ -219,24 +276,36 @@ def build_lr_scheduler(
         raise ValueError(f"Unknown scheduler type: {scheduler_type}")
 
 
-def build_aux_scheduler(config: Dict[str, Any]) -> Optional[AuxiliaryLossScheduler]:
-    """Build auxiliary loss scheduler from configuration.
+def build_loss_scheduler(
+    config: Dict[str, Any], 
+    total_steps: Optional[int] = None
+) -> Optional[LossScheduler]:
+    """Build loss scheduler from configuration.
     
     Args:
-        config: Auxiliary loss configuration
+        config: Loss configuration
+        total_steps: Total training steps
         
     Returns:
-        Auxiliary loss scheduler or None if not configured
+        Loss scheduler or None if not configured
     """
-    if not config or not config.get('enabled', False):
+    if not config:
         return None
     
-    schedule_config = config.get('schedule', {})
+    # For auxiliary loss, check if enabled
+    if 'enabled' in config and not config.get('enabled', False):
+        return None
     
-    return AuxiliaryLossScheduler(
-        base_weight=config.get('weight', 0.25),
-        schedule_type=schedule_config.get('type', 'constant'),
-        warmup_steps=schedule_config.get('warmup_steps', 5000),
-        hold_steps=schedule_config.get('hold_steps', 50000),
-        decay_steps=schedule_config.get('decay_steps', 30000)
+    # For regularization, check if weight > 0
+    if 'enabled' not in config and config.get('weight', 0.0) <= 0:
+        return None
+    
+    return LossScheduler(
+        base_weight=config.get('weight', 1.0),
+        schedule_type=config.get('type', 'constant'),
+        warmup_fraction=config.get('warmup_fraction', 0.05),
+        hold_fraction=config.get('hold_fraction'),
+        decay_fraction=config.get('decay_fraction'),
+        total_steps=total_steps,
+        max_fraction_of_supervised=config.get('max_fraction_of_supervised')
     )

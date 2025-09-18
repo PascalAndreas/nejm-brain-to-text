@@ -4,7 +4,7 @@ This module implements the main GRU-based CTC encoder by composing
 the various building blocks (Smoother, PreNet, GRU backbone, projection heads).
 """
 
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,10 +15,11 @@ from .blocks import (
     GRUBackbone,
     CTCHead,
     AuxiliaryHead,
-    TemperatureScaling,
-    mask_logits_
+    mask_logits_,
+    force_blank_on_pad_,
+    build_smoother,
+    flatten_ctc_targets
 )
-from .blocks.smoothers import build_smoother, SmootherBase
 
 
 class GRUCTC(NeuralEncoder):
@@ -73,18 +74,19 @@ class GRUCTC(NeuralEncoder):
         # Default smoother configuration
         if smoother_config is None:
             smoother_config = {
-                'type': 'depthwise_causal',
+                'type': 'depthwise',
                 'kernel_size': 11,
                 'residual_gate': True,
                 'init_std': 2.0
             }
         
-        # Create smoother
-        smoother_type = smoother_config.pop('type', 'depthwise_causal')
+        # Create smoother (copy config to avoid mutation)
+        sc = dict(smoother_config)
+        smoother_type = sc.pop('type', 'depthwise')
         self.smoother = build_smoother(
             smoother_type=smoother_type,
             num_features=input_dim,
-            config=smoother_config
+            config=sc
         )
         
         # Default PreNet configuration (no longer includes smoother)
@@ -103,17 +105,18 @@ class GRUCTC(NeuralEncoder):
                 'activation': 'softsign'
             }
         
-        # Create PreNet (now without smoother)
+        # Create PreNet (now without smoother, copy config to avoid mutation)
+        pc = dict(prenet_config)
         self.prenet = PreNet(
             input_dim=input_dim,
             num_days=num_days,
-            **prenet_config
+            **pc
         )
         
         # Get PreNet output dimension (changes if patching is used)
         prenet_output_dim = self.prenet.output_dim
         
-        # Create GRU backbone
+        # Create GRU backbone (uses optimal mixed packing strategy by default)
         self.backbone = GRUBackbone(
             input_size=prenet_output_dim,
             hidden_size=hidden_size,
@@ -121,39 +124,34 @@ class GRUCTC(NeuralEncoder):
             dropout=dropout,
             dropout_type='standard',
             bidirectional=False,
-            use_packed=True,
             learnable_h0=True
         )
         
-        # Main CTC head (now with built-in masking)
+        # Main CTC head with temperature scaling
         self.ctc_head = CTCHead(
             input_size=self.backbone.output_size,
             vocab_size=vocab_size,
             blank_idx=blank_idx,
-            dropout=dropout / 2  # Less dropout in final layer
+            dropout=dropout / 2,  # Less dropout in final layer
+            init_temp=temperature,
+            classwise_temp=False
         )
         
         # Optional auxiliary CTC head for deep supervision
         self.aux_head = None
         if aux_layer is not None and 0 <= aux_layer < num_layers:
             # Check if backbone supports auxiliary outputs
-            if hasattr(self.backbone, 'supports_aux') and self.backbone.supports_aux():
-                self.aux_head = AuxiliaryHead(
-                    input_size=self.backbone.output_size,
-                    vocab_size=vocab_size,
-                    hidden_size=None,  # Direct projection
-                    dropout=dropout / 2,
-                    layer_norm=True
-                )
-            else:
-                print(f"Warning: Backbone {type(self.backbone).__name__} does not support auxiliary outputs")
-                self.aux_layer = None
+            self.aux_head = AuxiliaryHead(
+                input_size=self.backbone.output_size,
+                vocab_size=vocab_size,
+                hidden_size=None,  # Direct projection
+                dropout=dropout / 2,
+                layer_norm=True
+            )
+        else:
+            self.aux_layer = None
         
-        # Temperature calibration
-        self.calibrator = TemperatureScaling(
-            initial_temperature=temperature,
-            learnable=False  # Will be fitted post-training
-        )
+        # Remove old calibrator - temperature is now handled by CTCHead
         
         # Track time reduction for proper length handling
         self._time_reduction = 1
@@ -191,13 +189,8 @@ class GRUCTC(NeuralEncoder):
             return_intermediates=(self.aux_head is not None)
         )
         
-        # Main CTC head (now handles masking internally)
-        if self.training:
-            # During training, don't apply temperature
-            log_probs = self.ctc_head(x, lengths, temperature=1.0)
-        else:
-            # During inference, apply calibrated temperature
-            log_probs = self.ctc_head(x, lengths, temperature=self.calibrator.temperature.item())
+        # Main CTC head with integrated temperature scaling and masking
+        log_probs = self.ctc_head(x, lengths)
         
         # Prepare auxiliary outputs if using deep supervision
         aux_outputs = {}
@@ -239,8 +232,12 @@ class GRUCTC(NeuralEncoder):
     def time_reduction(self) -> int:
         """Get the overall time reduction factor.
         
+        This returns an effective stride hint rather than an exact reduction ratio.
+        The actual length reduction depends on input length and is computed as:
+        floor((input_length - patch_size) / patch_stride) + 1
+        
         Returns:
-            Time reduction factor from patching
+            Effective stride factor from patching
         """
         return self._time_reduction
     
@@ -252,16 +249,56 @@ class GRUCTC(NeuralEncoder):
         """
         return True
     
-    def eval_calibrate(self, dev_loader: torch.utils.data.DataLoader) -> None:
+    def forward_for_calibration(self, batch: Batch):
+        """
+        Returns raw logits and lengths/targets for calibrator.
+
+        Expected keys on batch:
+          - batch.x, batch.x_lens, batch.y, batch.y_lens
+        """
+        with torch.no_grad():
+            # smoother -> prenet -> backbone
+            x, x_lens = self.smoother(batch.x, batch.x_lens)
+            x, x_lens = self.prenet(x, x_lens, day_indices=batch.day_id)
+            h, _hidden, _ = self.backbone(x, lengths=x_lens, return_intermediates=False)
+
+            # raw logits from projection (temperature NOT applied here)
+            logits = self.ctc_head.get_logits(h, lengths=x_lens, apply_temperature=False)
+
+            # Convert padded targets to 1D concatenated format for CTCLoss
+            targets = flatten_ctc_targets(batch.y, batch.y_lens)
+
+        return {
+            "logits": logits,                       # [B,T,V]
+            "input_lengths": x_lens,                # [B]
+            "targets": targets,                     # 1D concat
+            "target_lengths": batch.y_lens,         # [B]
+        }
+    
+    def eval_calibrate(self, dev_loader: torch.utils.data.DataLoader, device: str = "auto", **kwargs) -> None:
         """Calibrate temperature scaling on validation data.
         
         Args:
             dev_loader: Validation data loader
+            device: Device for calibration ("auto" detects from model)
+            **kwargs: Additional arguments for FitCTCTemperature (e.g., epochs, lr)
         """
+        from .blocks.calibrator import FitCTCTemperature
+        
+        # Resolve "auto" device to actual device string
+        if device == "auto":
+            device = str(next(self.parameters()).device)
+        
         print("Calibrating temperature on validation set...")
-        optimal_temp = self.calibrator.fit(self, dev_loader)
-        self.calibrator.set_temperature(optimal_temp)
-        print(f"Temperature calibration complete: T={optimal_temp:.4f}")
+        calibrator = FitCTCTemperature(blank_idx=self.blank_idx)
+        optimal_temp = calibrator.run(self, dev_loader, device=device, **kwargs)
+        final_temp = self.ctc_head.temperature()
+        print(f"Temperature calibration complete: T={optimal_temp:.4f} (final: {final_temp:.4f})")
+        print("\n🚨 IMPORTANT: Re-tune decoder hyperparameters after calibration!")
+        print("Temperature scaling changes acoustic scores - you must re-tune:")
+        print("- lm_weight (language model weight)")
+        print("- word_insertion_penalty") 
+        print("- beam_threshold (if using beam search)")
     
     def export_config(self) -> Dict[str, Any]:
         """Export model configuration for reproducibility.
@@ -308,11 +345,11 @@ class GRUCTC(NeuralEncoder):
                 'num_layers': self.num_layers,
                 'dropout': self.backbone.dropout,
                 'bidirectional': self.backbone.bidirectional,
-                'use_packed': self.backbone.use_packed,
-                'supports_aux': self.backbone.supports_aux()
+                'mixed_packing': True,  # Always uses optimal mixed packing strategy
+                'supports_aux': True  # Both our backbones support aux outputs
             },
             'aux_layer': self.aux_layer,
-            'temperature': self.calibrator.temperature.item(),
+            'temperature': self.ctc_head.temperature(),
             'blank_idx': self.blank_idx
         })
         return config

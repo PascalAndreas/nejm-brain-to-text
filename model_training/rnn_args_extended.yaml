@@ -6,7 +6,7 @@ model:
   n_layers: 5 # number of GRU layers
   patch_size: 14 # size of the input patches (14 time steps)
   patch_stride: 4 # stride for the input patches (4 time steps)
-
+  
   input_network:
     n_input_layers: 1 # number of input layers per network (one network for each day)
     input_layer_sizes:

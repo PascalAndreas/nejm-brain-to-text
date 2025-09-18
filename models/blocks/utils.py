@@ -226,7 +226,8 @@ def apply_locked_dropout(
     dropout_p: float,
     batch_size: int, 
     max_len: int,
-    feat_dim: Optional[int] = None
+    feat_dim: Optional[int] = None,
+    lengths: Optional[torch.LongTensor] = None
 ) -> torch.Tensor:
     """Apply locked dropout with consistent masks across time.
     
@@ -234,78 +235,74 @@ def apply_locked_dropout(
     for each sample, which helps preserve temporal dependencies better
     than standard dropout. Masks are regenerated for each forward pass.
     
+    Optimized to work directly with unpacked tensors for better performance.
+    
     Args:
-        seq: Input sequence (PackedSequence or tensor)
+        seq: Input sequence tensor [B, T, F] (should be unpacked)
         dropout_p: Dropout probability
         batch_size: Batch size
         max_len: Maximum sequence length
         feat_dim: Feature dimension (computed from seq if None)
+        lengths: Sequence lengths for masking (optional)
         
     Returns:
-        Sequence with locked dropout applied
+        Tensor with locked dropout applied
     """
     if dropout_p <= 0:
         return seq
-        
+    
+    # Work directly with unpacked tensor for efficiency
     if isinstance(seq, PackedSequence):
-        # Unpack for dropout application
-        x, lengths = pad_packed_sequence(seq, batch_first=True, total_length=max_len)
+        raise ValueError("apply_locked_dropout now expects unpacked tensors for better performance")
         
-        # Get feature dimension from actual sequence if not provided
-        if feat_dim is None:
-            feat_dim = seq.data.size(-1)
-        
-        # Create mask: [B, 1, F] - broadcasts across time dimension
-        # Generate fresh mask for each forward pass
-        mask = x.new_empty((batch_size, 1, feat_dim)).bernoulli_(1 - dropout_p).div_(1 - dropout_p)
-        
-        # Apply mask to all time steps
-        x = x * mask
-        
-        # Repack the sequence
-        return pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-    else:
-        # Handle regular tensor (not packed)
-        B, T, F = seq.shape
-        feat_dim = F if (feat_dim is None) else feat_dim
-        
-        # Create mask: [B, 1, F] - broadcasts across time dimension
-        # Generate fresh mask for each forward pass
-        mask = seq.new_empty((B, 1, feat_dim)).bernoulli_(1 - dropout_p).div_(1 - dropout_p)
-        
-        # Apply mask (broadcasts across time dimension)
-        return seq * mask
+    B, T, F = seq.shape
+    feat_dim = F if (feat_dim is None) else feat_dim
+    
+    # Create mask: [B, 1, F] - broadcasts across time dimension
+    # Generate fresh mask for each forward pass
+    mask = seq.new_empty((B, 1, feat_dim)).bernoulli_(1 - dropout_p).div_(1 - dropout_p)
+    
+    # Apply mask (broadcasts across time dimension)
+    seq = seq * mask
+    
+    # Apply length masking to zero out padding
+    if lengths is not None:
+        lengths_device = lengths.to(seq.device)
+        time_mask = torch.arange(T, device=seq.device).unsqueeze(0) < lengths_device.unsqueeze(1)
+        seq = seq * time_mask.unsqueeze(-1).float()
+    
+    return seq
 
 
 def apply_output_zoneout(
-    seq, zoneout_p, lengths, max_len, bidirectional=False
-):
+    seq: torch.Tensor, zoneout_p: float, lengths: Optional[torch.LongTensor], 
+    max_len: int, bidirectional: bool = False
+) -> torch.Tensor:
     """Apply output zoneout regularization.
     
     Output zoneout mixes current hidden states with previous time step states,
     providing regularization similar to true zoneout but compatible with cuDNN.
     
+    Optimized to work directly with unpacked tensors for better performance.
+    
     Args:
-        seq: Input sequence (PackedSequence or tensor)
+        seq: Input sequence tensor [B, T, F] (should be unpacked)
         zoneout_p: Zoneout probability
-        lengths: Sequence lengths
+        lengths: Sequence lengths for masking (optional)
         max_len: Maximum sequence length
         bidirectional: Whether the sequence is bidirectional
         
     Returns:
-        Sequence with zoneout applied
+        Tensor with zoneout applied
     """
     if zoneout_p <= 0:
         return seq
 
+    # Work directly with unpacked tensor for efficiency
     if isinstance(seq, PackedSequence):
-        x, lens = pad_packed_sequence(seq, batch_first=True, total_length=max_len)
-    else:
-        x, lens = seq, lengths
+        raise ValueError("apply_output_zoneout now expects unpacked tensors for better performance")
 
-    # Ensure lens on same device as x
-    if lens is not None and lens.device != x.device:
-        lens = lens.to(x.device)
+    x = seq
 
     # x: [B, T, F]; build time-shifted prev state (forward dir)
     prev = x.clone()
@@ -330,32 +327,50 @@ def apply_output_zoneout(
     y = mask * prev + (1 - mask) * x
 
     # Zero-out padded timesteps so they don't leak
-    if lens is not None:
-        # build boolean mask [B, T, 1]
+    if lengths is not None:
+        lengths_device = lengths.to(x.device)
         tt = torch.arange(max_len, device=x.device).unsqueeze(0)
-        valid = tt < lens.unsqueeze(1)
+        valid = tt < lengths_device.unsqueeze(1)
         y = y * valid.unsqueeze(-1)
 
-    if isinstance(seq, PackedSequence):
-        return pack_padded_sequence(y, lens.cpu(), batch_first=True, enforce_sorted=False)
-    else:
-        return y
+    return y
 
 
-def apply_interlayer_dropout(seq, layer_idx, batch_size, max_len, dropout, dropout_type, num_layers, dropout_modules, training):
-    """Apply inter-layer dropout (locked or standard)."""
+def apply_interlayer_dropout(seq, layer_idx, batch_size, max_len, dropout, dropout_type, num_layers, dropout_modules, training, lengths=None):
+    """Apply inter-layer dropout (locked or standard).
+    
+    Optimized to work with unpacked tensors for better performance.
+    """
     if not training or dropout <= 0 or layer_idx == num_layers - 1:
         return seq
     
+    # Work directly with unpacked tensor for efficiency
+    if isinstance(seq, PackedSequence):
+        raise ValueError("apply_interlayer_dropout now expects unpacked tensors for better performance")
+    
     if dropout_type == 'locked':
-        feat_dim = feat_dim_from_seq(seq, max_len, None)
-        return apply_locked_dropout(seq, dropout, batch_size, max_len, feat_dim)
+        feat_dim = seq.size(-1)
+        return apply_locked_dropout(seq, dropout, batch_size, max_len, feat_dim, lengths)
     else:
-        # Standard dropout
-        if isinstance(seq, PackedSequence):
-            data = dropout_modules[layer_idx](seq.data)
-            return PackedSequence(data, seq.batch_sizes, seq.sorted_indices, seq.unsorted_indices)
-        else:
-            return dropout_modules[layer_idx](seq)
+        # Standard dropout - work directly on unpacked tensor
+        return dropout_modules[layer_idx](seq)
+
+
+def flatten_ctc_targets(y: torch.Tensor, y_lens: torch.Tensor) -> torch.Tensor:
+    """Flatten padded targets to 1D concatenation for CTCLoss.
+    
+    CTCLoss expects targets as 1D concatenation of per-example sequences.
+    This is a common operation needed across training, calibration, and evaluation.
+    
+    Args:
+        y: Padded targets [B, L_max]
+        y_lens: True target lengths [B]
+        
+    Returns:
+        1D concatenated targets with length == sum(y_lens)
+    """
+    B, L_max = y.size()
+    mask = torch.arange(L_max, device=y.device).unsqueeze(0) < y_lens.unsqueeze(1)
+    return y[mask]
 
 
