@@ -51,72 +51,87 @@ class EMA:
         self.device = device
         self.updates = 0
         
+        # Numerically stable accumulation in fp32
+        self.shadow_dtype = torch.float32
+        
         # Create EMA parameters
         self.shadow = {}
         self.backup = {}
         
-        # Initialize with model parameters - will move to correct device on first update/apply
+        # Initialize with model parameters - cast to fp32 and store on CPU initially
         for name, param in model.named_parameters():
             if param.requires_grad:
-                # Store on CPU initially to avoid device mismatch during Lightning setup
-                self.shadow[name] = param.data.clone().cpu()
+                # Store in fp32 on CPU initially to avoid device mismatch during Lightning setup
+                self.shadow[name] = param.detach().to(self.shadow_dtype).cpu()
     
     def get_decay(self) -> float:
-        """Get decay rate (now fixed, bias correction removed for stability).
+        """Get decay rate with optional bias correction.
         
         Returns:
-            Fixed decay rate
+            Decay rate (potentially bias-corrected)
         """
-        # Use fixed decay for stability - dynamic decay can hurt training
-        return self.base_decay
+        if self.use_bias_correction and self.updates < self.warmup_steps:
+            # Linear warmup from 0 to base_decay over warmup_steps
+            warmup_progress = self.updates / max(1, self.warmup_steps)
+            decay = self.base_decay * warmup_progress
+            # Clamp to valid range
+            return float(max(0.0, min(self.base_decay, decay)))
+        else:
+            # Use fixed decay after warmup or if bias correction disabled
+            return float(self.base_decay)
     
     @torch.no_grad()
     def update(self):
         """Update EMA parameters with current model weights."""
         decay = self.get_decay()
         
+        # Collect tensors for batch operations
+        dst_tensors = []
+        src_tensors = []
+        
         for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                # Ensure shadow tensor is on the same device as parameter
-                if self.shadow[name].device != param.device:
-                    self.shadow[name] = self.shadow[name].to(param.device, non_blocking=True)
-                    
-                self.shadow[name] = (
-                    decay * self.shadow[name] +
-                    (1.0 - decay) * param.data
-                )
+            if not (param.requires_grad and name in self.shadow):
+                continue
+                
+            # Ensure shadow is on correct device and dtype (cache after first move)
+            shadow = self.shadow[name]
+            if shadow.device != param.device or shadow.dtype != self.shadow_dtype:
+                shadow = shadow.to(param.device, dtype=self.shadow_dtype, non_blocking=True)
+                self.shadow[name] = shadow
+            
+            dst_tensors.append(shadow)
+            # Cast source to fp32 for stable accumulation
+            src_tensors.append(param.detach().to(self.shadow_dtype))
+        
+        # Batch EMA update using foreach ops when available
+        if dst_tensors:
+            if hasattr(torch, '_foreach_mul_') and hasattr(torch, '_foreach_add_'):
+                torch._foreach_mul_(dst_tensors, decay)
+                torch._foreach_add_(dst_tensors, src_tensors, alpha=(1.0 - decay))
+            else:
+                # Fallback to individual updates
+                for dst, src in zip(dst_tensors, src_tensors):
+                    dst.mul_(decay).add_(src, alpha=(1.0 - decay))
         
         self.updates += 1
     
-    def should_update(self, step: int) -> bool:
-        """Determine if EMA should be updated at this step.
-        
-        Uses adaptive scheduling: more frequent updates early in training,
-        less frequent later to save compute.
-        
-        Args:
-            step: Current training step
-            
-        Returns:
-            True if EMA should be updated
-        """
-        # More frequent early (every step), less frequent later (every 50 steps)
-        update_freq = min(50, max(1, step // 1000))
-        return step % update_freq == 0
     
     def apply_shadow(self):
         """Apply EMA parameters to model (for evaluation)."""
         for name, param in self.model.named_parameters():
             if param.requires_grad and name in self.shadow:
-                self.backup[name] = param.data.clone()
-                # Ensure shadow tensor is on the same device as parameter
-                param.data = self.shadow[name].to(param.device, non_blocking=True)
+                self.backup[name] = param.detach().clone()
+                # Use in-place copy to avoid confusing optimizer state
+                param.detach().copy_(
+                    self.shadow[name].to(param.device, dtype=param.dtype, non_blocking=True)
+                )
     
     def restore(self):
         """Restore original parameters after evaluation."""
         for name, param in self.model.named_parameters():
             if param.requires_grad and name in self.backup:
-                param.data = self.backup[name]
+                # Use in-place copy to avoid confusing optimizer state
+                param.detach().copy_(self.backup[name])
         self.backup = {}
     
     def state_dict(self) -> Dict:
@@ -147,8 +162,7 @@ class EMA:
         """
         return {
             'ema_decay': self.get_decay(),
-            'ema_updates': self.updates,
-            'ema_update_freq': min(50, max(1, self.updates // 1000))
+            'ema_updates': self.updates
         }
 
 
@@ -177,7 +191,8 @@ class BrainToTextLightningModule(pl.LightningModule):
         use_ema: bool = True,
         ema_decay: float = 0.999,
         ema_bias_correction: bool = True,
-        ema_warmup_steps: int = 10
+        ema_warmup_steps: int = 10,
+        reset_schedulers_on_resume: bool = False
     ):
         super().__init__()
         
@@ -209,23 +224,21 @@ class BrainToTextLightningModule(pl.LightningModule):
         model_config['aux_layer'] = aux_layer
         self.model = GRUCTC(**model_config)
         
-        # EMA setup (simplified with fixed decay)
+        # EMA setup with bias correction to prevent early training haunting
         self.use_ema = use_ema
         self.ema = None
         if use_ema:
             self.ema = EMA(
                 self.model,
                 decay=ema_decay,
-                use_bias_correction=False,  # Disabled for stability
-                warmup_steps=0  # Not used with fixed decay
+                use_bias_correction=ema_bias_correction,
+                warmup_steps=ema_warmup_steps
             )
         
-        # Get total steps from scheduler config for fractional specifications
-        total_steps = self.scheduler_config.get('T_max', None)
-        
-        # Unified loss schedulers
-        self.aux_scheduler = build_loss_scheduler(self.aux_loss_config, total_steps)
-        self.reg_scheduler = build_loss_scheduler(self.film_reg_config, total_steps)
+        # Loss schedulers - will be properly initialized in configure_optimizers
+        # when trainer and total_steps are available
+        self.aux_scheduler = None
+        self.reg_scheduler = None
         
         # Loss function
         self.ctc_loss = nn.CTCLoss(
@@ -294,8 +307,7 @@ class BrainToTextLightningModule(pl.LightningModule):
         has_aux = bool(emissions.aux and 'aux_log_probs' in emissions.aux)
         w_aux_base = float(self.aux_loss_config.get('weight', 0.0))
         if self.aux_scheduler:
-            total_steps = getattr(self.trainer, 'estimated_stepping_batches', None) if self.trainer else None
-            w_aux_sched = float(self.aux_scheduler.get_weight(self.global_step, total_steps))
+            w_aux_sched = float(self.aux_scheduler.get_weight(self.global_step))
         else:
             w_aux_sched = 1.0
         w_aux = w_aux_base * w_aux_sched
@@ -329,12 +341,10 @@ class BrainToTextLightningModule(pl.LightningModule):
             
             # Get effective weight with scheduler and fraction guard
             if self.reg_scheduler is not None:
-                total_steps = getattr(self.trainer, 'estimated_stepping_batches', None) if self.trainer else None
                 w_reg_eff = self.reg_scheduler.get_effective_weight(
                     self.global_step, 
                     reg_term.item(), 
-                    sup_loss.detach().item(),
-                    total_steps
+                    sup_loss.detach().item()
                 )
             else:
                 w_reg_eff = 0.0
@@ -387,19 +397,6 @@ class BrainToTextLightningModule(pl.LightningModule):
             
             reg_to_sup_ratio = reg_contrib / (sup_base + 1e-12)
             self.log('train/reg_to_sup_ratio', reg_to_sup_ratio, on_step=True, on_epoch=True)
-        
-        # Log learning rate and EMA stats periodically
-        if self.global_step % 100 == 0:
-            # Log current learning rate
-            if self.lr_schedulers():
-                current_lr = self.lr_schedulers().get_last_lr()[0]
-                self.log('train/lr', current_lr)
-            
-            # Log EMA stats
-            if self.use_ema and self.ema is not None:
-                ema_stats = self.ema.get_stats()
-                for key, value in ema_stats.items():
-                    self.log(f'train/{key}', value)
         
         # Step auxiliary scheduler if present
         if self.aux_scheduler is not None:
@@ -588,8 +585,7 @@ class BrainToTextLightningModule(pl.LightningModule):
         
         # Update EMA after weights have been updated
         if self.use_ema and self.ema is not None:
-            if self.ema.should_update(self.global_step):
-                self.ema.update()
+            self.ema.update()
 
     def configure_optimizers(self):
         """Configure optimizer and scheduler.
@@ -606,8 +602,23 @@ class BrainToTextLightningModule(pl.LightningModule):
             eps=self.optimizer_config.get('eps', 1e-8)
         )
         
-        # Create learning rate scheduler
-        scheduler = build_lr_scheduler(optimizer, self.scheduler_config)
+        # Get total training steps from trainer (now available during configure_optimizers)
+        total_steps = None
+        try:
+            if hasattr(self, 'trainer') and self.trainer:
+                total_steps = getattr(self.trainer, 'estimated_stepping_batches', None)
+        except (RuntimeError, AttributeError):
+            # Fallback: this should not happen in normal Lightning flow
+            total_steps = None
+        
+        # Initialize loss schedulers now that we have total_steps
+        if self.aux_scheduler is None:
+            self.aux_scheduler = build_loss_scheduler(self.aux_loss_config, total_steps=total_steps)
+        if self.reg_scheduler is None:
+            self.reg_scheduler = build_loss_scheduler(self.film_reg_config, total_steps=total_steps)
+        
+        # Create learning rate scheduler with total_steps
+        scheduler = build_lr_scheduler(optimizer, self.scheduler_config, total_steps)
         
         return {
             'optimizer': optimizer,
@@ -649,8 +660,13 @@ class BrainToTextLightningModule(pl.LightningModule):
                 )
             self.ema.load_state_dict(checkpoint['ema_state'])
         
-        if self.aux_scheduler is not None and 'aux_scheduler_state' in checkpoint:
-            self.aux_scheduler.load_state_dict(checkpoint['aux_scheduler_state'])
-            
-        if self.reg_scheduler is not None and 'reg_scheduler_state' in checkpoint:
-            self.reg_scheduler.load_state_dict(checkpoint['reg_scheduler_state'])
+        # Load scheduler states unless reset_schedulers_on_resume is True
+        if not getattr(self.hparams, 'reset_schedulers_on_resume', False):
+            if self.aux_scheduler is not None and 'aux_scheduler_state' in checkpoint:
+                self.aux_scheduler.load_state_dict(checkpoint['aux_scheduler_state'])
+                
+            if self.reg_scheduler is not None and 'reg_scheduler_state' in checkpoint:
+                self.reg_scheduler.load_state_dict(checkpoint['reg_scheduler_state'])
+        else:
+            # Schedulers will be freshly initialized with new total_steps in configure_optimizers
+            print("Resetting schedulers - will use new schedule configuration")

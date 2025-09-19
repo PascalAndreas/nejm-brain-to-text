@@ -105,13 +105,8 @@ class LossScheduler:
             Loss weight
         """
         T = total_steps or self.total_steps
-        if T is None:
-            # Fallback for missing total_steps
-            if self.schedule_type == 'constant':
-                return self.base_weight
-            else:
-                # Simple linear warmup over 5000 steps then hold
-                return min(self.base_weight, self.base_weight * step / 5000)
+        if T is None and self.schedule_type != 'constant':
+            raise ValueError(f"LossScheduler with schedule_type '{self.schedule_type}' requires total_steps to be set")
         
         if self.schedule_type == 'constant':
             return self.base_weight
@@ -165,8 +160,7 @@ class LossScheduler:
         self, 
         step: int, 
         loss_value: float, 
-        supervised_loss: float, 
-        total_steps: Optional[int] = None
+        supervised_loss: float
     ) -> float:
         """Get effective weight with optional fraction-of-supervised guard.
         
@@ -174,12 +168,11 @@ class LossScheduler:
             step: Current training step
             loss_value: Current loss component value
             supervised_loss: Current supervised loss value
-            total_steps: Total steps
             
         Returns:
             Effective weight (potentially clamped by fraction guard)
         """
-        base_weight = self.get_weight(step, total_steps)
+        base_weight = self.get_weight(step)
         
         if (self.max_fraction_of_supervised is None or 
             self.max_fraction_of_supervised <= 0 or 
@@ -233,25 +226,57 @@ def build_lr_scheduler(
     scheduler_type = config.get('type', 'cosine')
     
     if scheduler_type == 'cosine':
+        # Use T_max from config, or total_steps if available, otherwise raise error
+        if 'T_max' in config:
+            T_max = config['T_max']
+        elif total_steps is not None:
+            T_max = total_steps
+        else:
+            raise ValueError("CosineAnnealingLR requires either 'T_max' in config or total_steps to be provided")
+        
         return CosineAnnealingLR(
             optimizer,
-            T_max=config.get('T_max', total_steps or 100000),
+            T_max=T_max,
             eta_min=config.get('min_lr', 1e-6)
         )
     
     elif scheduler_type == 'warmup_cosine':
+        # Calculate warmup_steps from warmup_fraction if provided
+        if 'warmup_fraction' in config and total_steps:
+            warmup_steps = int(config['warmup_fraction'] * total_steps)
+        elif 'warmup_steps' in config:
+            warmup_steps = config['warmup_steps']
+        else:
+            raise ValueError("WarmupCosineScheduler requires either 'warmup_fraction' with total_steps or 'warmup_steps' in config")
+        
+        # Get total_steps from parameter or config
+        if total_steps is not None:
+            scheduler_total_steps = total_steps
+        elif 'total_steps' in config:
+            scheduler_total_steps = config['total_steps']
+        else:
+            raise ValueError("WarmupCosineScheduler requires total_steps to be provided or 'total_steps' in config")
+            
         return WarmupCosineScheduler(
             optimizer,
-            warmup_steps=config.get('warmup_steps', 5000),
-            total_steps=total_steps or config.get('total_steps', 100000),
+            warmup_steps=warmup_steps,
+            total_steps=scheduler_total_steps,
             min_lr=config.get('min_lr', 1e-6)
         )
     
     elif scheduler_type == 'onecycle':
+        # Get total_steps from parameter or config
+        if total_steps is not None:
+            scheduler_total_steps = total_steps
+        elif 'total_steps' in config:
+            scheduler_total_steps = config['total_steps']
+        else:
+            raise ValueError("OneCycleLR requires total_steps to be provided or 'total_steps' in config")
+            
         return OneCycleLR(
             optimizer,
             max_lr=config.get('max_lr', 3e-4),
-            total_steps=total_steps or config.get('total_steps', 100000),
+            total_steps=scheduler_total_steps,
             pct_start=config.get('pct_start', 0.1),
             anneal_strategy=config.get('anneal_strategy', 'cos'),
             div_factor=config.get('div_factor', 25.0),
@@ -259,12 +284,14 @@ def build_lr_scheduler(
         )
     
     elif scheduler_type == 'linear':
-        # Simple linear decay
+        # Simple linear decay - requires total_steps
+        if total_steps is None and 'total_steps' not in config:
+            raise ValueError("Linear scheduler requires total_steps to be provided or 'total_steps' in config")
+        
+        scheduler_total_steps = total_steps or config['total_steps']
+        
         def lr_lambda(step):
-            if total_steps:
-                return max(0, 1 - step / total_steps)
-            else:
-                return 1.0
+            return max(0, 1 - step / scheduler_total_steps)
         
         return LambdaLR(optimizer, lr_lambda)
     

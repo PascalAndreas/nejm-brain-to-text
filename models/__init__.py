@@ -10,8 +10,8 @@ from .gru_ctc import GRUCTC
 from .lightning_module import BrainToTextLightningModule, EMA
 from .schedulers import (
     build_lr_scheduler,
-    build_aux_scheduler,
-    AuxiliaryLossScheduler,
+    build_loss_scheduler,
+    LossScheduler,
     WarmupCosineScheduler
 )
 
@@ -51,8 +51,8 @@ __all__ = [
     "EMA",
     "build_encoder",
     "build_lr_scheduler",
-    "build_aux_scheduler",
-    "AuxiliaryLossScheduler",
+    "build_loss_scheduler",
+    "LossScheduler",
     "WarmupCosineScheduler",
     "ENCODERS"
 ]

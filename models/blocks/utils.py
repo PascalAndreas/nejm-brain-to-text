@@ -370,6 +370,8 @@ def flatten_ctc_targets(y: torch.Tensor, y_lens: torch.Tensor) -> torch.Tensor:
         1D concatenated targets with length == sum(y_lens)
     """
     B, L_max = y.size()
+    # Ensure y_lens is on the same device as y
+    y_lens = y_lens.to(y.device)
     mask = torch.arange(L_max, device=y.device).unsqueeze(0) < y_lens.unsqueeze(1)
     return y[mask]
 

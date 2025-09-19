@@ -99,7 +99,7 @@ def create_callbacks(config: Dict[str, Any]) -> list:
     checkpoint_config = config.get('checkpointing', {})
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_config.get('save_dir', 'models/checkpoints'),
-        filename='{epoch:02d}-{val_per:.4f}',
+        filename='{epoch:02d}-{val/per:.4f}',
         monitor=checkpoint_config.get('monitor', 'val/per'),
         mode=checkpoint_config.get('mode', 'min'),
         save_top_k=checkpoint_config.get('save_top_k', 3),
@@ -190,7 +190,8 @@ def main(args):
         use_ema=config['training'].get('use_ema', True),
         ema_decay=config['training'].get('ema_decay', 0.999),
         ema_bias_correction=config['training'].get('ema_bias_correction', True),
-        ema_warmup_steps=config['training'].get('ema_warmup_steps', 10)
+        ema_warmup_steps=config['training'].get('ema_warmup_steps', 10),
+        reset_schedulers_on_resume=config.get('checkpointing', {}).get('reset_schedulers_on_resume', False)
     )
     
     # Create callbacks
@@ -220,8 +221,8 @@ def main(args):
         enable_model_summary=True
     )
     
-    # Resume from checkpoint if specified
-    ckpt_path = args.resume if args.resume else None
+    # Resume from checkpoint if specified (command line takes precedence over config)
+    ckpt_path = args.resume if args.resume else config.get('checkpointing', {}).get('resume_from_checkpoint')
     
     # Train model
     trainer.fit(

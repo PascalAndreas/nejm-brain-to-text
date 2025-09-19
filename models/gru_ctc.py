@@ -40,6 +40,9 @@ class GRUCTC(NeuralEncoder):
         hidden_size: GRU hidden state size
         num_layers: Number of GRU layers
         dropout: Dropout probability
+        dropout_type: Type of dropout ('standard' or 'locked')
+        bidirectional: Whether to use bidirectional GRU
+        zoneout: Zoneout probability for RNN regularization
         smoother_config: Configuration for temporal smoother
         prenet_config: Configuration for PreNet
         aux_layer: Layer index for auxiliary CTC (None to disable)
@@ -55,6 +58,9 @@ class GRUCTC(NeuralEncoder):
         hidden_size: int = 768,
         num_layers: int = 5,
         dropout: float = 0.2,
+        dropout_type: str = 'standard',
+        bidirectional: bool = False,
+        zoneout: float = 0.0,
         smoother_config: Optional[Dict[str, Any]] = None,
         prenet_config: Optional[Dict[str, Any]] = None,
         aux_layer: Optional[int] = None,
@@ -122,8 +128,9 @@ class GRUCTC(NeuralEncoder):
             hidden_size=hidden_size,
             num_layers=num_layers,
             dropout=dropout,
-            dropout_type='standard',
-            bidirectional=False,
+            dropout_type=dropout_type,
+            zoneout=zoneout,
+            bidirectional=bidirectional,
             learnable_h0=True
         )
         
@@ -344,7 +351,9 @@ class GRUCTC(NeuralEncoder):
                 'hidden_size': self.hidden_size,
                 'num_layers': self.num_layers,
                 'dropout': self.backbone.dropout,
+                'dropout_type': self.backbone.dropout_type,
                 'bidirectional': self.backbone.bidirectional,
+                'zoneout': self.backbone.zoneout,
                 'mixed_packing': True,  # Always uses optimal mixed packing strategy
                 'supports_aux': True  # Both our backbones support aux outputs
             },
