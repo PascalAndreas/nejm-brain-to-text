@@ -251,16 +251,17 @@ class BrainToTextLightningModule(pl.LightningModule):
         
         # Removed unused best model tracking (Lightning handles this)
     
-    def forward(self, batch: Batch) -> Emissions:
+    def forward(self, batch: Batch, aux_weight: float = 1.0) -> Emissions:
         """Forward pass through the model.
         
         Args:
             batch: Input batch
+            aux_weight: Current auxiliary loss weight (0.0 skips aux computation)
             
         Returns:
             Model emissions
         """
-        return self.model(batch)
+        return self.model(batch, aux_weight=aux_weight)
     
     def forward_for_calibration(self, batch):
         """Forward pass for temperature calibration.
@@ -376,8 +377,16 @@ class BrainToTextLightningModule(pl.LightningModule):
         # Convert to standard batch format
         batch = Batch.from_dataset_batch(batch)
         
-        # Forward pass
-        emissions = self.forward(batch)
+        # Calculate auxiliary weight for conditional computation
+        w_aux_base = float(self.aux_loss_config.get('weight', 0.0))
+        if self.aux_scheduler:
+            w_aux_sched = float(self.aux_scheduler.get_weight(self.global_step))
+        else:
+            w_aux_sched = 1.0
+        w_aux = w_aux_base * w_aux_sched
+        
+        # Forward pass with aux weight for conditional computation
+        emissions = self.forward(batch, aux_weight=w_aux)
         
         # Compute loss
         loss, loss_dict = self.compute_loss(batch, emissions)
@@ -428,7 +437,8 @@ class BrainToTextLightningModule(pl.LightningModule):
         batch = Batch.from_dataset_batch(batch)
         
         # Forward pass (EMA weights already applied at epoch start)
-        emissions = self.forward(batch)
+        # Skip aux computation during validation for efficiency
+        emissions = self.forward(batch, aux_weight=0.0)
         
         # Compute loss
         loss, loss_dict = self.compute_loss(batch, emissions)

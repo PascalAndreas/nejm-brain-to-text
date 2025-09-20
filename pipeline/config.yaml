@@ -4,7 +4,7 @@
 # Dataset configuration
 dataset:
   data_root: data/t15_copyTask_neuralData
-  batch_size: 32
+  batch_size: 16
   num_workers: 8
   pin_memory: false  # Not supported on MPS
   
@@ -78,19 +78,18 @@ training:
   
   # Learning rate scheduler (steps calculated from epochs)
   scheduler:
-    type: warmup_cosine  # 'cosine', 'warmup_cosine', 'onecycle', etc.
-    warmup_fraction: 0.05  # Warmup for 5% of total training steps
+    type: cosine  # 'cosine', 'warmup_cosine', 'onecycle', etc.
     # total_steps calculated automatically from max_epochs and dataset size
     min_lr: 0.000001
   
   # Auxiliary CTC loss configuration (deep supervision)
   aux_loss:
     enabled: true  # Enable auxiliary loss
-    weight: 0.25  # Base weight for auxiliary loss
+    weight: 0.20  # Base weight for auxiliary loss
     type: warmup_hold_decay  # Warmup, hold, then decay pattern
-    warmup_fraction: 0.05  # Ramp up over first 5% of training
-    hold_fraction: 0.75    # Hold at full weight for 75% of training
-    decay_fraction: 0.20   # Decay over last 20% of training
+    warmup_fraction: 0.00  # Ramp up over first 5% of training
+    hold_fraction: 0.10    # Hold at full weight for 75% of training
+    decay_fraction: 0.10   # Decay over last 20% of training
   
   # FiLM regularization scheduling
   film_reg:
@@ -101,7 +100,7 @@ training:
     max_fraction_of_supervised: 0.05  # Limit reg to 5% of supervised loss
   
   # Training settings
-  max_epochs: 100
+  max_epochs: 30
   gradient_clip_val: 1.0
   accumulate_grad_batches: 2
   val_check_interval: 1.0    # Validate once per epoch (reduces overhead)
@@ -114,7 +113,7 @@ training:
   use_ema: true
   ema_decay: 0.999
   ema_bias_correction: true  # Use bias-corrected EMA
-  ema_warmup_steps: 10  # Warmup steps for bias correction
+  ema_warmup_steps: 0  # Warmup steps for bias correction
   
   # Data augmentation
   augmentation:

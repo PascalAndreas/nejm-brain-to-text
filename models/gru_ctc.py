@@ -169,11 +169,12 @@ class GRUCTC(NeuralEncoder):
                 # This is approximate; exact reduction depends on input length
                 self._time_reduction = patch_stride
     
-    def forward(self, batch: Batch) -> Emissions:
+    def forward(self, batch: Batch, aux_weight: float = 1.0) -> Emissions:
         """Forward pass through the encoder.
         
         Args:
             batch: Input batch with neural features and metadata
+            aux_weight: Current auxiliary loss weight (0.0 skips aux computation)
             
         Returns:
             Emissions with log probabilities and lengths
@@ -190,10 +191,11 @@ class GRUCTC(NeuralEncoder):
         x, lengths = self.prenet(x, lengths, day_indices)
         
         # GRU backbone with packed sequences
-        # Request intermediates if auxiliary head is enabled
+        # Only request intermediates if aux head exists AND aux_weight > 0
+        need_intermediates = (self.aux_head is not None and aux_weight > 0)
         x, hidden, intermediates = self.backbone(
             x, lengths, 
-            return_intermediates=(self.aux_head is not None)
+            return_intermediates=need_intermediates
         )
         
         # Main CTC head with integrated temperature scaling and masking
@@ -202,7 +204,7 @@ class GRUCTC(NeuralEncoder):
         # Prepare auxiliary outputs if using deep supervision
         aux_outputs = {}
         
-        if self.aux_head is not None and intermediates is not None:
+        if self.aux_head is not None and intermediates is not None and aux_weight > 0:
             # Get features from the specified intermediate layer
             if self.aux_layer < len(intermediates):
                 aux_features = intermediates[self.aux_layer]
