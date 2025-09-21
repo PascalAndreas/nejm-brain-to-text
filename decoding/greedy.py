@@ -93,7 +93,7 @@ class GreedyCTCDecoder:
             seq_len = logit_lengths[i].item()
             logit_seq = logits[i, :seq_len]  # [time, vocab]
             
-            # Greedy decoding
+            # Greedy decoding - argmax works on both logits and log probabilities
             pred_tokens = torch.argmax(logit_seq, dim=-1)  # [time]
             
             # Remove blanks and consecutive duplicates

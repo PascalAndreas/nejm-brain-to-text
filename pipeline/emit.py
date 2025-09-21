@@ -14,8 +14,17 @@ from tqdm import tqdm
 import pickle
 import h5py
 
-from ..models.base import Batch, Emissions, NeuralEncoder
-from ..models import build_encoder
+# Handle imports for both package and direct execution
+try:
+    from ..models.base import Batch, Emissions, NeuralEncoder
+    from ..models import build_encoder
+except ImportError:
+    import sys
+    from pathlib import Path
+    project_root = Path(__file__).parent.parent
+    sys.path.insert(0, str(project_root))
+    from models.base import Batch, Emissions, NeuralEncoder
+    from models import build_encoder
 
 
 class EmissionCache:
@@ -96,6 +105,11 @@ class EmissionCache:
                         # Extract individual emission
                         log_probs = emissions.log_probs[i, :emissions.out_lens[i]].cpu()
                         
+                        # Get ground truth if available
+                        ground_truth = None
+                        if batch.meta and 'sentence_labels' in batch.meta:
+                            ground_truth = batch.meta['sentence_labels'][i]
+                        
                         emissions_dict[utt_id] = {
                             'log_probs': log_probs.numpy() if self.format == 'npz' else log_probs,
                             'out_len': emissions.out_lens[i].item(),
@@ -104,6 +118,8 @@ class EmissionCache:
                                 'session': batch.meta['sessions'][i] if batch.meta else None,
                                 'block': batch.meta['block_nums'][i].item() if batch.meta else None,
                                 'trial': batch.meta['trial_nums'][i].item() if batch.meta else None,
+                                'corpus': batch.meta['corpora'][i] if batch.meta and 'corpora' in batch.meta else 'Unknown',
+                                'ground_truth': ground_truth,
                             }
                         }
                         
@@ -221,7 +237,11 @@ class EmissionCache:
                     if 'meta' in emission:
                         for key, value in emission['meta'].items():
                             if value is not None:
-                                grp.attrs[key] = value
+                                # Handle string values properly for HDF5
+                                if isinstance(value, str):
+                                    grp.attrs[key] = value.encode('utf-8')
+                                else:
+                                    grp.attrs[key] = value
     
     def _load_emissions(self, cache_file: Path) -> Dict:
         """Load emissions from disk.
@@ -249,7 +269,7 @@ class EmissionCache:
             utt_ids = set()
             
             for key in data.files:
-                if key.endswith('_log_probs'):
+                if key.endswith('_log_probs') and not key.endswith('_aux_log_probs'):
                     utt_id = key[:-10]  # Remove '_log_probs'
                     utt_ids.add(utt_id)
             
@@ -289,9 +309,13 @@ class EmissionCache:
                         emission['aux_log_probs'] = torch.from_numpy(grp['aux_log_probs'][:])
                     
                     # Load metadata from attributes
-                    for key in ['day_id', 'session', 'block', 'trial']:
+                    for key in ['day_id', 'session', 'block', 'trial', 'corpus']:
                         if key in grp.attrs:
-                            emission['meta'][key] = grp.attrs[key]
+                            value = grp.attrs[key]
+                            # Decode string attributes
+                            if isinstance(value, bytes):
+                                value = value.decode('utf-8')
+                            emission['meta'][key] = value
                     
                     emissions_dict[utt_id] = emission
             
@@ -302,7 +326,8 @@ def cache_model_emissions(
     model_checkpoint: str,
     data_config: Dict[str, Any],
     cache_config: Optional[Dict[str, Any]] = None,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    model_config: Optional[Dict[str, Any]] = None
 ) -> Dict[str, str]:
     """High-level function to cache emissions for all splits.
     
@@ -316,23 +341,105 @@ def cache_model_emissions(
         Dictionary mapping split names to cache file paths
     """
     from torch.utils.data import DataLoader
-    from ..dataset import BrainToTextDataset, collate_fn
+    try:
+        from ..dataset import BrainToTextDataset, collate_fn
+    except ImportError:
+        from dataset import BrainToTextDataset, collate_fn
     
     # Load model
     checkpoint = torch.load(model_checkpoint, map_location=device)
     
     if 'model_config' in checkpoint:
-        model = build_encoder(
-            checkpoint['model_config']['name'],
-            checkpoint['model_config']['params']
-        )
+        # Handle different checkpoint formats
+        checkpoint_config = checkpoint['model_config']
+        if 'name' in checkpoint_config and 'params' in checkpoint_config:
+            # New format with explicit name and params
+            model = build_encoder(
+                checkpoint_config['name'],
+                checkpoint_config['params']
+            )
+        elif 'class' in checkpoint_config:
+            # Export format from export_config()
+            class_name = checkpoint_config['class']
+            if class_name == 'GRUCTC':
+                try:
+                    from ..models.gru_ctc import GRUCTC
+                except ImportError:
+                    from models.gru_ctc import GRUCTC
+                
+                # Use external model config if provided, otherwise try to infer from checkpoint
+                if model_config is not None and 'params' in model_config:
+                    model = GRUCTC(**model_config['params'])
+                else:
+                    # Try to extract parameters from checkpoint_config or use defaults
+                    model = GRUCTC()
+            else:
+                raise ValueError(f"Unknown model class: {class_name}")
+        else:
+            raise ValueError(f"Unknown checkpoint_config format: {checkpoint_config}")
     else:
-        # Try to load from state dict
-        from ..models.gru_ctc import GRUCTC
-        model = GRUCTC()
+        # Fallback: assume GRUCTC for compatibility, but use external config if available
+        try:
+            from ..models.gru_ctc import GRUCTC
+        except ImportError:
+            from models.gru_ctc import GRUCTC
+        
+        if model_config is not None and 'params' in model_config:
+            model = GRUCTC(**model_config['params'])
+        else:
+            model = GRUCTC()
     
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
+    # Load model weights - prefer EMA weights if available
+    if 'ema_state' in checkpoint:
+        print("Loading EMA weights for emission caching...")
+        # Import EMA class
+        try:
+            from ..models.lightning_module import EMA
+        except ImportError:
+            from models.lightning_module import EMA
+        
+        # Load base model weights first
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            # Lightning checkpoint - extract model weights
+            state_dict = {}
+            for key, value in checkpoint['state_dict'].items():
+                if key.startswith('model.'):
+                    # Remove 'model.' prefix for the inner model
+                    new_key = key[6:]  # Remove 'model.' prefix
+                    state_dict[new_key] = value
+        else:
+            raise ValueError("Could not find model weights in checkpoint")
+        
+        model.load_state_dict(state_dict)
+        model = model.to(device)
+        
+        # Initialize EMA and apply shadow weights
+        ema = EMA(model)
+        ema.load_state_dict(checkpoint['ema_state'])
+        ema.apply_shadow()
+        print("✅ EMA weights applied for emission caching")
+    else:
+        print("⚠️  No EMA weights found, using raw model weights...")
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            # Lightning checkpoint - extract model weights
+            state_dict = {}
+            for key, value in checkpoint['state_dict'].items():
+                if key.startswith('model.'):
+                    # Remove 'model.' prefix for the inner model
+                    new_key = key[6:]  # Remove 'model.' prefix
+                    state_dict[new_key] = value
+        else:
+            raise ValueError("Could not find model weights in checkpoint")
+            
+        model.load_state_dict(state_dict)
+        model = model.to(device)
+    
     model.eval()
     
     # Create cache manager

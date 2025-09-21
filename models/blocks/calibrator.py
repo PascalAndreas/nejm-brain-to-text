@@ -13,6 +13,7 @@ import math
 import os
 from typing import Optional, Dict, Any
 import torch
+from ..base import Batch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -169,9 +170,10 @@ class FitCTCTemperature:
 
     @torch.no_grad()
     def _move_batch_to(self, batch, device: str):
-        """Move batch to device."""
+        """Move batch to device and convert dict to Batch object if needed."""
         if isinstance(batch, dict):
-            return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            # Convert dict to Batch object first
+            batch = Batch.from_dataset_batch(batch)
         if hasattr(batch, "to"):
             return batch.to(device)
         return batch

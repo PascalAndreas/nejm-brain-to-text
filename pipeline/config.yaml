@@ -140,11 +140,11 @@ decoding:
   impl: flashlight_ctc
   
   # Token and lexicon files
-  tokens: language_models/flashlight_decoder_vocab.txt
-  lexicon: language_models/lexicon.txt
+  tokens: decoding/artifacts/tokens.txt
+  lexicon: decoding/artifacts/lexicon.csv
   
   # Language model
-  kenlm: language_models/mixed-lower.binary
+  kenlm: language_models/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
   
   # Decoder hyperparameters (to be tuned)
   lm_weight: 2.5

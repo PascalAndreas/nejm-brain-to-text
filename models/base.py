@@ -63,6 +63,7 @@ class Batch:
             'block_nums': batch.get('block_nums'),
             'trial_nums': batch.get('trial_nums'),
             'corpora': batch.get('corpora'),
+            'sentence_labels': batch.get('sentence_labels'),
         }
         
         # Ensure x_lens is torch.long on CPU (required for pack_padded_sequence)

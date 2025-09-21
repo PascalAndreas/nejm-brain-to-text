@@ -316,8 +316,8 @@ class FlashlightCTCDecoder:
                 logit_seq = logits[i, :seq_len].cpu().numpy()  # [time, vocab]
                 
                 # Flashlight expects LOG PROBABILITIES in [T, N] format where N is vocab size
-                # Convert raw logits to log probabilities (log-softmax)
-                log_probs = torch.log_softmax(torch.from_numpy(logit_seq), dim=-1).float().contiguous().numpy()
+                # Input is already log probabilities from the model
+                log_probs = logit_seq.astype(np.float32)
                 
                 # Decode with Flashlight - use raw data pointer as integer
                 T, N = log_probs.shape
