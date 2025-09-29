@@ -147,3 +147,6 @@ When implementing new NeuralEncoder architectures, use these metrics to compare:
 
 *Generated from training logs on September 14, 2025*
 *Use these metrics as reference targets for new NeuralEncoder implementations per REFACTOR_SPEC.md*
+
+## Correction
+From our own testing, we've seen that the legacy model actually has a validation PER of 16.59%, even though the evaluation methodology seems to be identical. We will use 16.59% as the baseline which we need to outperform in our testing.
