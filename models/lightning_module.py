@@ -220,9 +220,17 @@ class BrainToTextLightningModule(pl.LightningModule):
         self.film_reg_config = (training_config or {}).get('film_reg', {'weight': 0.0})
         
         # Create model (simplified - always use GRUCTC for now)
-        aux_layer = model_config.pop('aux_layer', self.aux_loss_config.get('layer', None))
-        model_config['aux_layer'] = aux_layer
-        self.model = GRUCTC(**model_config)
+        # Extract model parameters from nested structure if needed
+        if 'params' in model_config:
+            model_params = model_config['params'].copy()
+        else:
+            model_params = model_config.copy()
+            
+        # Handle aux_layer configuration
+        aux_layer = model_params.pop('aux_layer', self.aux_loss_config.get('layer', None))
+        model_params['aux_layer'] = aux_layer
+        
+        self.model = GRUCTC(**model_params)
         
         # EMA setup with bias correction to prevent early training haunting
         self.use_ema = use_ema

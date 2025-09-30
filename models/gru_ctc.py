@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from .base import Batch, Emissions, NeuralEncoder
 from .blocks import (
     PreNet,
+    WindowProjection,
     GRUBackbone,
     CTCHead,
     AuxiliaryHead,
@@ -63,6 +64,7 @@ class GRUCTC(NeuralEncoder):
         zoneout: float = 0.0,
         smoother_config: Optional[Dict[str, Any]] = None,
         prenet_config: Optional[Dict[str, Any]] = None,
+        window_projection_config: Optional[Dict[str, Any]] = None,
         aux_layer: Optional[int] = None,
         temperature: float = 1.0,
         blank_idx: int = 0
@@ -122,9 +124,22 @@ class GRUCTC(NeuralEncoder):
         # Get PreNet output dimension (changes if patching is used)
         prenet_output_dim = self.prenet.output_dim
         
+        # Create window projection if configured
+        if window_projection_config is not None:
+            wpc = dict(window_projection_config)  # Copy to avoid mutation
+            # Set input_dim from PreNet output if not specified
+            if 'input_dim' not in wpc:
+                wpc['input_dim'] = prenet_output_dim
+            
+            self.window_projection = WindowProjection(**wpc)
+            backbone_input_dim = self.window_projection.output_dim
+        else:
+            self.window_projection = None
+            backbone_input_dim = prenet_output_dim
+        
         # Create GRU backbone (uses optimal mixed packing strategy by default)
         self.backbone = GRUBackbone(
-            input_size=prenet_output_dim,
+            input_size=backbone_input_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
             dropout=dropout,
@@ -189,6 +204,10 @@ class GRUCTC(NeuralEncoder):
         
         # PreNet: day adaptation, activation, patching
         x, lengths = self.prenet(x, lengths, day_indices)
+        
+        # Window projection: gradual dimensionality reduction
+        if self.window_projection is not None:
+            x, lengths = self.window_projection(x, lengths)
         
         # GRU backbone with packed sequences
         # Only request intermediates if aux head exists AND aux_weight > 0
@@ -266,9 +285,14 @@ class GRUCTC(NeuralEncoder):
           - batch.x, batch.x_lens, batch.y, batch.y_lens
         """
         with torch.no_grad():
-            # smoother -> prenet -> backbone
+            # smoother -> prenet -> window_projection -> backbone
             x, x_lens = self.smoother(batch.x, batch.x_lens)
             x, x_lens = self.prenet(x, x_lens, day_indices=batch.day_id)
+            
+            # Window projection if configured
+            if self.window_projection is not None:
+                x, x_lens = self.window_projection(x, x_lens)
+            
             h, _hidden, _ = self.backbone(x, lengths=x_lens, return_intermediates=False)
 
             # raw logits from projection (temperature NOT applied here)
@@ -327,6 +351,11 @@ class GRUCTC(NeuralEncoder):
             'patch_stride': self.prenet.patch_stride,
         }
         
+        # Window projection configuration
+        window_projection_config = None
+        if self.window_projection is not None:
+            window_projection_config = self.window_projection.export_config()
+        
         # Day adapter configuration
         if hasattr(self.prenet, 'day_adapter') and self.prenet.day_adapter is not None:
             adapter = self.prenet.day_adapter
@@ -348,6 +377,7 @@ class GRUCTC(NeuralEncoder):
             'num_layers': self.num_layers,
             'smoother': smoother_config,
             'prenet': prenet_config,
+            'window_projection': window_projection_config,
             'backbone': {
                 'type': 'gru',
                 'hidden_size': self.hidden_size,

@@ -1,0 +1,273 @@
+# Brain-to-Text Pipeline Configuration
+# This configuration defines the complete pipeline from neural data to text
+
+# Dataset configuration
+dataset:
+  data_root: data/t15_copyTask_neuralData
+  batch_size: 16
+  num_workers: 8
+  pin_memory: false  # Not supported on MPS
+  
+  # Data splits to use
+  splits: [train, val, test]
+  
+  # Optional corpus filtering
+  corpus_filter: null  # e.g., ['50-Word', 'Switchboard']
+  
+  # Bad trials to exclude
+  bad_trials_dict: null
+  
+  # Random seed for reproducibility
+  random_seed: 42
+
+# Model configuration
+model:
+  name: gru_v1  # Model identifier from registry
+  
+  # Model parameters
+  params:
+    input_dim: 512
+    vocab_size: 41
+    num_days: 45  # Updated to match real dataset (0-44)
+    hidden_size: 512  # 512 per direction = 1024 total for bidirectional
+    num_layers: 5     # Deep model for better performance
+    dropout: 0.30     # Increased inter-layer dropout
+    dropout_type: standard
+    bidirectional: true
+    zoneout: 0.0      # Remove zoneout for now
+    blank_idx: 0
+    
+    # Smoother configuration (separate from PreNet)
+    smoother_config:
+      type: depthwise
+      kernel_size: 11  # Kernel size for convolution-based smoothers
+      residual_gate: true  # Gated residual connection
+      init_std: 2.0  # Standard deviation for initialization
+      causal: true  # Causal depthwise (no future leakage)
+    
+    # PreNet configuration (no longer includes smoother)
+    prenet_config:
+      # Day-specific adaptation (FiLM)
+      day_adapter_config:
+        grouping: blocks8  # 'full', 'blocks8', or integer
+        identity_init: true
+        l2_tether: 0.0001
+        l1_reg: 0.0
+      
+      # Patching configuration (unchanged for comparability)
+      patch_config:
+        size: 12  # Concatenate 12 frames 
+        stride: 4   # Stride of 4 frames (4x time reduction)
+      
+      # Activation function
+      activation: softsign
+    
+    # Window projection configuration (gradual dimensionality reduction)
+    window_projection_config:
+      input_dim: 6144      # From patching: 512 * 12
+      intermediate_dim: 1536  # Intermediate dimension for GLU
+      output_dim: 1024     # Output to GRU (matches bidirectional hidden_size * 2)
+      dropout: 0.1         # Dropout in projection layers
+      layer_norm: true     # Use layer normalization
+      bias: true           # Use bias in linear layers
+    
+    # Auxiliary layer for deep supervision (None to disable)
+    aux_layer: 3  # Attach to layer 3 of 5
+    
+    # Temperature calibration settings
+    temperature: 1.0  # Initial temperature for calibration (1.0 = no scaling)
+
+# Training configuration
+training:
+  # Optimizer settings
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+  
+  # Learning rate scheduler (steps calculated from epochs)
+  scheduler:
+    type: warmup_cosine  # 'cosine', 'warmup_cosine', 'onecycle', etc.
+    # total_steps calculated automatically from max_epochs and dataset size
+    warmup_fraction: 0.05
+    min_lr: 0.000001
+  
+  # Auxiliary CTC loss configuration (deep supervision)
+  aux_loss:
+    enabled: true  # Enable auxiliary loss
+    weight: 0.20  # Base weight for auxiliary loss
+    type: warmup_hold_decay  # Warmup, hold, then decay pattern
+    warmup_fraction: 0.10  # Ramp up over first 5% of training
+    hold_fraction: 0.10    # Hold at full weight for 10%
+    decay_fraction: 0.10   # Decay over last 20% of training
+  
+  # FiLM regularization scheduling
+  film_reg:
+    weight: 1.0  # Base weight for FiLM regularization (multiplies DayAdapter's l2/l1)
+    type: warmup_hold_decay  # Warmup then decay pattern
+    warmup_fraction: 0.05  # Warmup from 0 over first 5% of training
+    hold_fraction: 0.30    # Hold at full weight for 30%
+    decay_fraction: 0.65   # Cosine decay over last 65% of training
+    max_fraction_of_supervised: 0.05  # Limit reg to 5% of supervised loss
+  
+  # Training settings
+  max_epochs: 35
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 2
+  val_check_interval: 1.0    # Validate once per epoch (reduces overhead)
+  log_every_n_steps: 20     # Reduced logging frequency for better performance
+  
+  # Mixed precision training
+  precision: 32  # Only 32-bit precision supported on MPS
+  
+  # EMA configuration with bias correction
+  use_ema: true
+  ema_decay: 0.999
+  ema_bias_correction: true  # Use bias-corrected EMA
+  ema_warmup_steps: 200  # Warmup steps for bias correction (prevents early training artifacts)
+  
+  # Data augmentation
+  augmentation:
+    time_mask:
+      enabled: true
+      num_masks: 2
+      mask_width: 40
+    
+    channel_mask:
+      enabled: true
+      mask_prob: 0.1
+    
+    channel_dropout:
+      enabled: true
+      dropout_prob: 0.05
+    
+    noise_injection:
+      enabled: false
+      noise_std: 0.01
+
+# Decoding configuration
+decoding:
+  # Decoder implementation
+  impl: flashlight_ctc
+  
+  # Token and lexicon files
+  tokens: decoding/artifacts/tokens.txt
+  lexicon: decoding/artifacts/lexicon.csv
+  
+  # Language model
+  kenlm: language_models/4gram-pruned-0_2_7_9-en-lm-set-1.0.bin
+  
+  # Decoder hyperparameters (to be tuned)
+  lm_weight: 2.5
+  word_score: -0.2
+  sil_score: 0.0
+  beam_size: 100
+  beam_size_token: 10
+  beam_threshold: 20.0
+  
+  # N-best list size for potential rescoring
+  nbest: 50
+  
+  # Greedy decoding for quick validation
+  use_greedy_for_val: true
+
+# Temperature calibration configuration
+calibration:
+  enabled: true  # Enable post-training temperature calibration
+  
+  # Calibration settings
+  epochs: 50  # Number of calibration epochs
+  lr: 0.01  # Learning rate for temperature optimization
+  
+  # Calibration method
+  classwise_temp: false  # If true, use per-class temperature scaling
+  
+  # Device settings (auto-detect from model if not specified)
+  device: auto
+
+# Emission caching configuration
+emission_cache:
+  cache_dir: cache/emissions
+  format: npz  # 'npz', 'pt', or 'hdf5'
+  compress: true
+
+# Checkpoint configuration
+checkpointing:
+  save_dir: models/checkpoints/A1
+  save_top_k: 3
+  monitor: val/per  # Phoneme error rate
+  mode: min
+  save_last: true
+  
+  # Resume from checkpoint (optional)
+  resume_from_checkpoint: null  # Set to checkpoint path to resume training, null for fresh start
+  
+  # Reset schedulers when resuming (optional)
+  reset_schedulers_on_resume: false  # If true, don't load scheduler states from checkpoint
+  
+# Logging configuration
+logging:
+  logger: wandb  # Using Weights & Biases for experiment tracking
+  project: brain-to-text
+  name: gru_ctc_A1
+  save_dir: logs
+  log_model: false  # Log model artifacts to wandb
+  
+# Hardware configuration
+hardware:
+  accelerator: mps   # Explicit MPS for Apple Silicon (with fallback enabled)
+  devices: 1  # Number of GPUs/devices
+  strategy: auto  # 'auto', 'ddp', 'dp', etc.
+  
+# Experiment tracking
+experiment:
+  seed: 42
+  deterministic: true
+  benchmark: true   # Enable kernel auto-tuning for consistent input shapes
+  
+  # Tags for experiment tracking
+  tags:
+    - configA1
+    - window_projection
+    - glu_activation
+    - causal_smoother
+    - biGRU_512
+    - bottleneck_fix
+    - diagnostic_driven
+  
+  # Notes
+  notes: |
+    Config A1: Diagnostic-driven architecture addressing information bottleneck:
+    
+    Model Architecture:
+    - 5-layer bidirectional GRU with 512 units per direction (1024 total)
+    - Window projection: 6144→1536→GLU→1024 (gradual dimensionality reduction)
+    - Causal depthwise smoother (k=11, no future leakage)
+    - FiLM day adaptation with block grouping and L2 tethering
+    - Patching (size=12, stride=4) unchanged for comparability
+    - Increased inter-layer dropout (0.35) with locked/variational type
+    - Removed zoneout for simplicity
+    - Auxiliary CTC at layer 3 with warmup-decay scheduling
+    - Main CTC head with temperature scaling and proper masking
+    - Fixed-decay EMA with bias correction for stability
+    
+    Key Changes from Diagnostic Analysis:
+    - Addresses 97% information loss at PreNet→GRU transition (CKA: 0.030)
+    - GLU activation provides gated information flow
+    - Gradual 6144→1536→1024 reduction vs abrupt 6144→768
+    - Bidirectional processing for better representation capacity
+    
+    Performance Optimizations (based on profiling):
+    - Batch size 64 for optimal throughput (reduces overhead-to-computation ratio)
+    - 8 workers for efficient data loading  
+    - Validation once per epoch (reduces 5-7x training loop overhead)
+    - Reduced logging frequency (every 200 steps vs 100)
+    - Explicit MPS accelerator with fallback enabled for CTC loss
+    - Kernel auto-tuning enabled for consistent input shapes
+    - pin_memory=False (not supported on MPS)
+    - Updated to 45 days to match real dataset structure
+    - Original patch settings (14/4) for 2x training speedup vs current (4/2)
+    - Scheduler uses warmup_fraction instead of fixed steps for scalability
+    - Bidirectional, zoneout, and dropout_type parameters explicitly configured
+    - Locked dropout for better RNN temporal consistency

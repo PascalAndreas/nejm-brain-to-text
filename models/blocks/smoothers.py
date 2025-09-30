@@ -61,10 +61,10 @@ class SmootherBase(ABC, nn.Module):
 
 
 class DepthwiseSmoother(SmootherBase):
-    """Learnable depthwise *non-causal* convolution for temporal smoothing.
+    """Learnable depthwise convolution for temporal smoothing.
     
     - One kernel per feature channel, normalized with softmax (sum=1).
-    - Symmetric receptive field (same padding).
+    - Supports both causal and non-causal modes.
     - Length-aware masked renormalization to preserve DC gain near edges
       and avoid bias from zero padding in batched variable-length inputs.
     
@@ -74,6 +74,7 @@ class DepthwiseSmoother(SmootherBase):
         residual_gate: If True, use gated residual connection y = (1-α)x + α·conv(x)
         init_std: Standard deviation for Gaussian initialization (in frames)
         eps: Small epsilon for numerical stability in renormalization
+        causal: If True, use causal convolution (no future leakage)
     """
 
     def __init__(
@@ -83,6 +84,7 @@ class DepthwiseSmoother(SmootherBase):
         residual_gate: bool = True,
         init_std: float = 2.0,
         eps: float = 1e-8,
+        causal: bool = False,
     ):
         super().__init__()
         if kernel_size % 2 == 0:
@@ -92,6 +94,7 @@ class DepthwiseSmoother(SmootherBase):
         self.kernel_size = kernel_size
         self.residual_gate = residual_gate
         self.eps = eps
+        self.causal = causal
 
         # Learnable per-channel kernels in log-space -> softmax along K
         self.kernel_params = nn.Parameter(torch.zeros(num_features, 1, kernel_size))
@@ -116,7 +119,7 @@ class DepthwiseSmoother(SmootherBase):
         x: torch.FloatTensor,
         lengths: Optional[torch.LongTensor] = None
     ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
-        """Apply depthwise non-causal smoothing with masked renormalization.
+        """Apply depthwise smoothing with masked renormalization (causal or non-causal).
         
         Args:
             x: Input tensor [B, T, F]
@@ -142,10 +145,18 @@ class DepthwiseSmoother(SmootherBase):
         # Expand mask channel-wise to match depthwise groups
         mF = m.expand(B, num_feats, T)                              # [B,F,T]
 
-        # Symmetric padding for both x and m (same amount left/right)
-        padding = self.kernel_size // 2
-        xt_pad = F.pad(xt, (padding, padding), mode="reflect")  # [B,F,T+2p]
-        m_pad  = F.pad(mF, (padding, padding), mode="constant", value=0.0)  # mask still needs zero padding
+        # Apply padding based on causal mode
+        if self.causal:
+            # Causal padding: pad only on the left (past frames only)
+            padding_left = self.kernel_size - 1
+            padding_right = 0
+            xt_pad = F.pad(xt, (padding_left, padding_right), mode="reflect")  # [B,F,T+p]
+            m_pad  = F.pad(mF, (padding_left, padding_right), mode="constant", value=0.0)
+        else:
+            # Symmetric padding for both x and m (same amount left/right)
+            padding = self.kernel_size // 2
+            xt_pad = F.pad(xt, (padding, padding), mode="reflect")  # [B,F,T+2p]
+            m_pad  = F.pad(mF, (padding, padding), mode="constant", value=0.0)  # mask still needs zero padding
 
         # Depthwise conv on x*m and on m, using the same per-channel kernel
         num = F.conv1d(xt_pad * m_pad, k, groups=num_feats)         # [B,F,T]
@@ -184,6 +195,7 @@ class DepthwiseSmoother(SmootherBase):
             "num_features": self.num_features,
             "kernel_size": self.kernel_size,
             "residual_gate": self.residual_gate,
+            "causal": self.causal,
             "gate_value": torch.sigmoid(self.gate_param).item() if self.residual_gate else None,
         }
 
@@ -438,7 +450,7 @@ class IdentitySmoother(SmootherBase):
 # Smoother registry for easy instantiation
 SMOOTHERS = {
     'gaussian': GaussianSmoother,
-    'depthwise': DepthwiseSmoother,                 # New default: non-causal
+    'depthwise': DepthwiseSmoother,  # Supports both causal and non-causal modes
     'ema': EMASmoother,
     'identity': IdentitySmoother,
     'none': IdentitySmoother,  # Alias
@@ -467,6 +479,7 @@ def build_smoother(
         raise ValueError(f"Unknown smoother type: {smoother_type}. Available: {list(SMOOTHERS.keys())}")
     
     config = config or {}
+    
     smoother_class = SMOOTHERS[smoother_type]
     
     # Add num_features to config

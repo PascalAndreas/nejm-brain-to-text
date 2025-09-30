@@ -14,6 +14,7 @@ from .smoothers import (
     build_smoother,
     SMOOTHERS
 )
+from .window_projection import WindowProjection
 from .rnn import GRUBackbone, LSTMBackbone
 from .head import ProjectionHead, AuxiliaryHead, MultiHeadProjection, CTCHead
 from .utils import (
@@ -38,6 +39,9 @@ __all__ = [
     "IdentitySmoother",
     "build_smoother",
     "SMOOTHERS",
+    
+    # Window projection
+    "WindowProjection",
     
     # RNN backbones
     "GRUBackbone",
