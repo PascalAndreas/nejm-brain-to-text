@@ -19,5 +19,5 @@
 /cache/
 /logs/
 /models/checkpoints/
-/tuning_results_corrected/
-/tuning_results_fixed/
+/tuning_results*
+*.png

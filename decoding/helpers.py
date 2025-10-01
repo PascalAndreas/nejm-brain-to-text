@@ -20,40 +20,60 @@ def load_tokens(tokens_path: str) -> List[str]:
     return tokens
 
 
-def load_lexicon_with_probs(lexicon_path: str, verbose: Optional[bool] = False) -> Dict[str, Tuple[List[str], float]]:
+def load_lexicon_entries(lexicon_path: str, verbose: Optional[bool] = False) -> List[Tuple[str, str, float]]:
     """
-    Load lexicon with 1-gram log probabilities from CSV format.
-    Returns dict mapping phoneme sequences to (word_list, log_prob) tuples.
+    Load lexicon entries with individual probabilities preserved.
+    Returns list of (word, phoneme_sequence, log_prob) tuples.
     """
-    lexicon_dict = {}
+    entries = []
     
     try:
         with open(lexicon_path, 'r') as f:
             reader = csv.reader(f)
             next(reader)  # Skip header
             
-            phoneme_to_entries = defaultdict(list)
             for row in reader:
                 if len(row) >= 3:
                     word = row[0]
                     phonemes = row[1]
                     log_prob = float(row[2])
-                    phoneme_to_entries[phonemes].append((word, log_prob))
-            
-            # For each phoneme sequence, collect words and use the best log prob
-            for phonemes, entries in phoneme_to_entries.items():
-                words = [entry[0] for entry in entries]
-                # Use the highest log probability among all words for this phoneme sequence
-                best_log_prob = max(entry[1] for entry in entries)
-                lexicon_dict[phonemes] = (words, best_log_prob)
+                    entries.append((word, phonemes, log_prob))
         
-        total_entries = sum(len(words) for words, _ in lexicon_dict.values())
         if verbose:
-            print(f"Loaded {len(lexicon_dict)} unique pronunciations with {total_entries} word entries")
+            print(f"Loaded {len(entries)} lexicon entries with individual probabilities")
         
     except Exception as e:
         print(f"Warning: Could not load lexicon: {e}")
-        lexicon_dict = {}
+        entries = []
+    
+    return entries
+
+
+def load_lexicon_with_probs(lexicon_path: str, verbose: Optional[bool] = False) -> Dict[str, Tuple[List[str], float]]:
+    """
+    Load lexicon with 1-gram log probabilities from CSV format.
+    Returns dict mapping phoneme sequences to (word_list, log_prob) tuples.
+    
+    DEPRECATED: This function collapses probabilities incorrectly. Use load_lexicon_entries() instead.
+    Kept for backward compatibility with greedy decoder.
+    """
+    entries = load_lexicon_entries(lexicon_path, verbose=False)
+    lexicon_dict = {}
+    
+    phoneme_to_entries = defaultdict(list)
+    for word, phonemes, log_prob in entries:
+        phoneme_to_entries[phonemes].append((word, log_prob))
+    
+    # For each phoneme sequence, collect words and use the best log prob
+    for phonemes, word_prob_pairs in phoneme_to_entries.items():
+        words = [entry[0] for entry in word_prob_pairs]
+        # Use the highest log probability among all words for this phoneme sequence
+        best_log_prob = max(entry[1] for entry in word_prob_pairs)
+        lexicon_dict[phonemes] = (words, best_log_prob)
+    
+    if verbose:
+        total_entries = sum(len(words) for words, _ in lexicon_dict.values())
+        print(f"Loaded {len(lexicon_dict)} unique pronunciations with {total_entries} word entries")
     
     return lexicon_dict
 

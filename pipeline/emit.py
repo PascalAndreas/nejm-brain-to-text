@@ -107,7 +107,7 @@ class EmissionCache:
                         
                         # Get ground truth if available
                         ground_truth = None
-                        if batch.meta and 'sentence_labels' in batch.meta:
+                        if batch.meta and 'sentence_labels' in batch.meta and batch.meta['sentence_labels'] is not None:
                             ground_truth = batch.meta['sentence_labels'][i]
                         
                         emissions_dict[utt_id] = {
@@ -115,9 +115,9 @@ class EmissionCache:
                             'out_len': emissions.out_lens[i].item(),
                             'meta': {
                                 'day_id': batch.day_id[i].item() if batch.day_id is not None else None,
-                                'session': batch.meta['sessions'][i] if batch.meta else None,
-                                'block': batch.meta['block_nums'][i].item() if batch.meta else None,
-                                'trial': batch.meta['trial_nums'][i].item() if batch.meta else None,
+                                'session': batch.meta['sessions'][i] if batch.meta and 'sessions' in batch.meta else None,
+                                'block_num': batch.meta['block_nums'][i].item() if batch.meta and 'block_nums' in batch.meta else None,
+                                'trial_num': batch.meta['trial_nums'][i].item() if batch.meta and 'trial_nums' in batch.meta else None,
                                 'corpus': batch.meta['corpora'][i] if batch.meta and 'corpora' in batch.meta else 'Unknown',
                                 'ground_truth': ground_truth,
                             }
