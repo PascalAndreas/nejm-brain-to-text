@@ -201,7 +201,7 @@ checkpointing:
   save_last: true
   
   # Resume from checkpoint (optional)
-  resume_from_checkpoint: null  # Set to checkpoint path to resume training, null for fresh start
+  resume_from_checkpoint: models/checkpoints/A1/epoch=13-val/per=0.1409.ckpt  # Resume from interrupted training
   
   # Reset schedulers when resuming (optional)
   reset_schedulers_on_resume: false  # If true, don't load scheduler states from checkpoint
@@ -211,6 +211,8 @@ logging:
   logger: wandb  # Using Weights & Biases for experiment tracking
   project: brain-to-text
   name: gru_ctc_A1
+  id: 0mggrmtn  # Set to your W&B run ID to resume the same run (e.g., "abc12345")
+  resume: "allow"  # Allow resuming if ID is provided
   save_dir: logs
   log_model: false  # Log model artifacts to wandb
   

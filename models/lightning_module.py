@@ -148,11 +148,17 @@ class EMA:
     
     def load_state_dict(self, state_dict: Dict):
         """Load EMA state from checkpoint."""
+        # Load shadow weights directly (device handling happens in to() method)
         self.shadow = state_dict['shadow']
         self.base_decay = state_dict.get('base_decay', self.base_decay)
         self.updates = state_dict.get('updates', 0)
         self.use_bias_correction = state_dict.get('use_bias_correction', True)
         self.warmup_steps = state_dict.get('warmup_steps', 10)
+    
+    def to(self, device):
+        """Move EMA shadow weights to specified device."""
+        self.shadow = {k: v.to(device) for k, v in self.shadow.items()}
+        return self
     
     def get_stats(self) -> Dict[str, float]:
         """Get EMA statistics for logging.
@@ -243,6 +249,30 @@ class BrainToTextLightningModule(pl.LightningModule):
                 warmup_steps=ema_warmup_steps
             )
         
+        # Initialize training components
+        self._setup_training_components()
+    
+    def to(self, *args, **kwargs):
+        """Override to() to ensure EMA shadows move with the model."""
+        # Move the model first
+        result = super().to(*args, **kwargs)
+        
+        # Move EMA shadows to the same device
+        if self.use_ema and self.ema is not None:
+            # Extract device from args (handle both positional and keyword arguments)
+            device = None
+            if args:
+                device = args[0]  # First positional argument is usually device
+            elif 'device' in kwargs:
+                device = kwargs['device']
+            
+            if device is not None:
+                self.ema.to(device)
+                
+        return result
+    
+    def _setup_training_components(self):
+        """Initialize training components after model creation."""
         # Loss schedulers - will be properly initialized in configure_optimizers
         # when trainer and total_steps are available
         self.aux_scheduler = None
@@ -423,6 +453,10 @@ class BrainToTextLightningModule(pl.LightningModule):
     
     def on_validation_epoch_start(self):
         """Apply EMA weights at start of validation epoch."""
+        # PyTorch Lightning's on_validation_model_eval() fails for checkpoint-loaded models
+        # due to missing trainer attachment, so we must explicitly call eval()
+        self.eval()
+        
         if self.use_ema and self.ema is not None:
             self.ema.apply_shadow()
     
@@ -455,7 +489,7 @@ class BrainToTextLightningModule(pl.LightningModule):
         for key, value in loss_dict.items():
             self.log(f'val/{key}', value, on_step=False, on_epoch=True, prog_bar=(key == 'total_loss'))
         
-        # Compute phoneme error rate
+        # Compute phoneme error rate and entropy
         if batch.y is not None:
             # Greedy decoding
             predictions = torch.argmax(emissions.log_probs, dim=-1)
@@ -464,6 +498,20 @@ class BrainToTextLightningModule(pl.LightningModule):
             blank_idx = self.model.blank_idx if hasattr(self.model, 'blank_idx') else 0
             per = self.compute_per(predictions, batch.y, emissions.out_lens, batch.y_lens, blank_idx)
             self.log('val/per', per, on_step=False, on_epoch=True, prog_bar=True)
+            
+            # Compute entropy of output probabilities
+            probs = torch.exp(emissions.log_probs)  # Convert log_probs to probs
+            entropy = -torch.sum(probs * emissions.log_probs, dim=-1)  # H = -sum(p * log(p))
+            
+            # Average entropy over valid timesteps and batch
+            valid_entropy = []
+            for i in range(len(emissions.out_lens)):
+                valid_steps = entropy[i, :emissions.out_lens[i]]
+                valid_entropy.append(valid_steps.mean())
+            
+            if valid_entropy:
+                mean_entropy = torch.stack(valid_entropy).mean()
+                self.log('val/entropy', mean_entropy, on_step=False, on_epoch=True, prog_bar=False)
         
         return loss
     
@@ -671,6 +719,7 @@ class BrainToTextLightningModule(pl.LightningModule):
                     warmup_steps=self.hparams.get('ema_warmup_steps', 10)
                 )
             self.ema.load_state_dict(checkpoint['ema_state'])
+            print(f"✅ EMA state loaded (decay={self.ema.base_decay}, updates={self.ema.updates})")
         
         # Load scheduler states unless reset_schedulers_on_resume is True
         if not getattr(self.hparams, 'reset_schedulers_on_resume', False):

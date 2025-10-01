@@ -99,7 +99,7 @@ def create_callbacks(config: Dict[str, Any]) -> list:
     checkpoint_config = config.get('checkpointing', {})
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_config.get('save_dir', 'models/checkpoints'),
-        filename='{epoch:02d}-{val/per:.4f}',
+        filename='{epoch:02d}',
         monitor=checkpoint_config.get('monitor', 'val/per'),
         mode=checkpoint_config.get('mode', 'min'),
         save_top_k=checkpoint_config.get('save_top_k', 3),
@@ -144,14 +144,26 @@ def create_logger(config: Dict[str, Any]):
     """
     logging_config = config.get('logging', {})
     
-    logger = WandbLogger(
-        project=logging_config.get('project', 'brain-to-text'),
-        name=logging_config.get('name', 'experiment'),
-        save_dir=logging_config.get('save_dir', 'logs'),
-        log_model=logging_config.get('log_model', False),
-        tags=config.get('experiment', {}).get('tags'),
-        notes=config.get('experiment', {}).get('notes')
-    )
+    # Build logger arguments
+    logger_kwargs = {
+        'project': logging_config.get('project', 'brain-to-text'),
+        'name': logging_config.get('name', 'experiment'),
+        'save_dir': logging_config.get('save_dir', 'logs'),
+        'log_model': logging_config.get('log_model', False),
+        'tags': config.get('experiment', {}).get('tags'),
+        'notes': config.get('experiment', {}).get('notes')
+    }
+    
+    # Add resume functionality if ID is provided
+    run_id = logging_config.get('id')
+    if run_id is not None:
+        logger_kwargs['id'] = run_id
+        logger_kwargs['resume'] = logging_config.get('resume', 'allow')
+        print(f"📊 Resuming W&B run: {run_id}")
+    else:
+        print(f"📊 Starting new W&B run: {logger_kwargs['name']}")
+    
+    logger = WandbLogger(**logger_kwargs)
     
     return logger
 
